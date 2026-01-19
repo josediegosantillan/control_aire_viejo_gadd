@@ -1,15 +1,13 @@
 #pragma once
-#include "esp_err.h"
 
 #ifdef __cplusplus
 extern "C" {
 #endif
 
 /**
- * @brief Inicia la gestión de conectividad.
- * - Gestiona conexión STA (Cliente).
- * - Si falla, levanta AP + Portal Cautivo.
- * - Incluye servidor DNS para Captive Portal (Pop-up automático).
+ * @brief Inicia la lógica de conexión WiFi.
+ * - Si hay credenciales guardadas en NVS: Intenta conectar a la red.
+ * - Si falla o no hay datos: Levanta el Portal Cautivo (AP: HELADERA_SETUP).
  */
 void wifi_portal_init(void);
 

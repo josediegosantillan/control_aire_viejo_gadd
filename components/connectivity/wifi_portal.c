@@ -26,7 +26,8 @@ static const char *TAG = "WIFI_PORTAL";
     #define AP_PASS_CONFIG "123456789" 
 #endif
 
-#define AP_SSID         "HELADERA_SETUP"
+// --- CAMBIO AQUÍ: NOMBRE DE LA RED ---
+#define AP_SSID         "Aire_Lennox_GaddBar" 
 #define MAX_RETRY       3
 #define DNS_PORT        53
 #define HTTP_TIMEOUT_SEC 10
@@ -56,7 +57,6 @@ static void safe_strcpy(char *dst, const char *src, size_t dst_size) {
     dst[dst_size - 1] = '\0';
 }
 
-// CORRECCIÓN: Límite de reintentos para evitar bucle infinito
 static int http_recv_full(httpd_req_t *req, char *buf, size_t total_len) {
     size_t received = 0;
     int retries = 0;
@@ -185,7 +185,6 @@ static void dns_server_task(void *pvParameters) {
                 data[idx++] = 0x00; data[idx++] = 0x3C; 
                 data[idx++] = 0x00; data[idx++] = 0x04; 
                 
-                // CORRECCIÓN: Obtener IP real del AP
                 uint32_t ip_addr = 0;
                 esp_netif_t* netif_ap = esp_netif_get_handle_from_ifkey("WIFI_AP_DEF");
                 if (netif_ap) {
@@ -244,7 +243,6 @@ static char* perform_wifi_scan_safe(void) {
     uint16_t ap_num = 0;
     esp_wifi_scan_get_ap_num(&ap_num);
     
-    // CORRECCIÓN: Manejar 0 redes
     if (ap_num == 0) return strdup("<option value='' disabled>⚠️ No se encontraron redes</option>");
     if (ap_num > 15) ap_num = 15;
 

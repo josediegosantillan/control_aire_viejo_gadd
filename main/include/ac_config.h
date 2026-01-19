@@ -20,7 +20,7 @@
 
 // --- SEGURIDAD ---
 #define WDT_TIMEOUT_MS      5000  // 5 Segundos para Watchdog
-#define SAFETY_DELAY_MIN    3     // 3 Minutos de espera compresor
+#define SAFETY_DELAY_MIN    0     // 3 Minutos de espera compresor
 
 // --- PROTECCIÓN ANTI-CONGELAMIENTO ---
 #define FREEZE_LIMIT_C      0.0   // Cortar si baja de 0°C
