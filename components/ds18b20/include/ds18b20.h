@@ -7,33 +7,34 @@
 extern "C" {
 #endif
 
-// Definición del "Manejador" (Handle) del sensor. 
-// Es un puntero oculto para manejar varias instancias.
-typedef struct ds18b20_context_t* ds18b20_device_handle_t;
+// Definición de una dirección ROM (8 bytes) para identificar cada sensor
+typedef struct {
+    uint8_t addr[8];
+} ds18b20_addr_t;
 
 /**
- * @brief Inicializa un nuevo sensor DS18B20 en un pin específico.
- * * @param pin El GPIO donde conectaste el sensor (ej: GPIO_NUM_4).
- * @param handle Puntero donde se guardará la referencia al sensor creado.
- * @return esp_err_t ESP_OK si salió todo bien.
+ * @brief Inicializa el pin GPIO para el bus OneWire.
+ * Llamar UNA sola vez al principio (en task_climate).
  */
-esp_err_t ds18b20_new_device(gpio_num_t pin, ds18b20_device_handle_t *handle);
+void ds18b20_init_bus(gpio_num_t pin);
 
 /**
- * @brief Realiza la conversión y lectura de temperatura.
- * * NOTA: Esta función es BLOQUEANTE. Tarda aprox 750ms en retornar 
- * porque espera a que el sensor termine de convertir. 
- * Durante esa espera, cede el control al RTOS (vTaskDelay), no clava la CPU.
- * * @param handle El manejador del sensor que querés leer.
- * @param temp Puntero donde se guardará el valor flotante (Grados Celsius).
- * @return esp_err_t ESP_OK si la lectura fue exitosa (CRC ok).
+ * @brief Envía la orden de conversión a TODOS los sensores del bus.
+ * Esta función es BLOQUEANTE: espera los 750ms necesarios (vTaskDelay) 
+ * antes de retornar, para asegurar que la conversión terminó.
+ * @param pin El GPIO del bus.
  */
-esp_err_t ds18b20_read_temp(ds18b20_device_handle_t handle, float *temp);
+esp_err_t ds18b20_convert_all(gpio_num_t pin);
 
 /**
- * @brief Libera la memoria del sensor (si alguna vez necesitaras borrarlo).
+ * @brief Lee la temperatura de un sensor específico usando su ID (Match ROM).
+ * NO espera conversión (asume que ya llamaste a convert_all antes).
+ * La lectura es rápida (~15-20ms).
+ * * @param pin El GPIO del bus.
+ * @param address La dirección de 8 bytes del sensor (ej: 0x28, 0xBB...).
+ * @param temp Puntero donde guardar el valor flotante.
  */
-void ds18b20_delete_device(ds18b20_device_handle_t handle);
+esp_err_t ds18b20_read_one(gpio_num_t pin, ds18b20_addr_t address, float *temp);
 
 #ifdef __cplusplus
 }

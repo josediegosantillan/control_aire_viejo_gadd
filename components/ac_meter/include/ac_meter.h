@@ -5,15 +5,15 @@ extern "C" {
 #endif
 
 /**
- * @brief Inicializa el hardware de medición (ADC OneShot)
+ * @brief Inicializa el hardware de medición (ADC, Timers, etc.)
  */
 void ac_meter_init(void);
 
 /**
- * @brief Lee los valores RMS calculados
- * @param v Puntero para devolver Voltaje (V)
+ * @brief Lee los valores RMS calculados (Voltaje, Corriente, Potencia).
+ * * @param v Puntero para devolver Voltaje (V)
  * @param i Puntero para devolver Corriente (A)
- * @param w Puntero para devolver Potencia (W)
+ * @param w Puntero para devolver Potencia Activa (W)
  */
 void ac_meter_read_rms(float *v, float *i, float *w);
 
