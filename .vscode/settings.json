@@ -14,5 +14,7 @@
     "--background-index",
     "--query-driver=**",
     "--compile-commands-dir=c:\\Users\\diego\\control_aire_acondicinado\\build"
-  ]
+  ],
+  "idf.flashType": "UART",
+  "idf.portWin": "COM7"
 }

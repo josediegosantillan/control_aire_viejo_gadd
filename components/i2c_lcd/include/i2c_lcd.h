@@ -1,29 +1,34 @@
 #pragma once
+#include <stdint.h>
 #include "esp_err.h"
-#include <stdbool.h>
 
-// Dirección I2C común: 0x27 (o 0x3F en algunos modelos)
-#define LCD_ADDR 0x27 
-#define LCD_COLS 16
-#define LCD_ROWS 2
+#ifdef __cplusplus
+extern "C" {
+#endif
 
-// Inicializa el bus I2C y el LCD
-void lcd_init(void);
+// Dirección común de displays I2C (PCF8574)
+// Si no te anda, probá cambiar a 0x3F
+#define I2C_lcd_addr 0x27 
 
-// Envía texto (filtra caracteres no imprimibles)
-void lcd_send_string(const char *str);
+/**
+ * @brief Inicializa el LCD.
+ * @param addr Dirección I2C (usualmente I2C_lcd_addr)
+ */
+void i2c_lcd_init(uint8_t addr);
 
-// Mueve el cursor (fila 0-1, columna 0-15)
-void lcd_set_cursor(int row, int col);
+/**
+ * @brief Borra todo el contenido de la pantalla.
+ */
+void i2c_lcd_clear(void);
 
-// Limpia la pantalla
-void lcd_clear(void);
+/**
+ * @brief Escribe texto en una posición específica.
+ * @param row Fila (0 a 3)
+ * @param col Columna (0 a 19)
+ * @param text Cadena de texto a mostrar
+ */
+void i2c_lcd_write_text(uint8_t row, uint8_t col, const char *text);
 
-// Regresa cursor a posición inicial
-void lcd_home(void);
-
-// Controla el backlight (encendido/apagado)
-void lcd_backlight(bool on);
-
-// Imprime texto formateado en posición específica
-void lcd_printf(int row, int col, const char *format, ...);
+#ifdef __cplusplus
+}
+#endif

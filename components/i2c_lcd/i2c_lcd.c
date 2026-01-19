@@ -3,276 +3,111 @@
 #include "esp_log.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
-#include "rom/ets_sys.h"
-#include <string.h>
-#include <stdarg.h>
-#include <stdio.h>
+#include "esp_rom_sys.h" // Para usar retardos en microsegundos si hace falta
 
 static const char *TAG = "LCD";
+#define I2C_NUM I2C_NUM_0
 
-// --- PINES I2C ---
-#define I2C_MASTER_SCL_IO           22
-#define I2C_MASTER_SDA_IO           21
-#define I2C_MASTER_NUM              0
-// Velocidad baja para máxima estabilidad con cables largos
-#define I2C_MASTER_FREQ_HZ          50000 
-#define I2C_MASTER_TX_BUF_DISABLE   0
-#define I2C_MASTER_RX_BUF_DISABLE   0
+static uint8_t _addr;
 
-// Bits de control del PCF8574
-#define LCD_BACKLIGHT   0x08  // Bit 3: Backlight on
-#define LCD_ENABLE      0x04  // Bit 2: Enable
-#define LCD_RW          0x02  // Bit 1: Read/Write (0=Write)
-#define LCD_RS          0x01  // Bit 0: Register Select (0=Cmd, 1=Data)
+// Máscaras de bits comunes para backpacks PCF8574 genéricos
+// P0=RS, P1=RW, P2=EN, P3=Backlight, P4-P7=Data
+#define LCD_RS_CMD 0x00
+#define LCD_RS_DATA 0x01
+#define LCD_RW 0x02
+#define LCD_EN 0x04
+#define LCD_BL 0x08 // Backlight ON
 
-// Reintentos para comunicación I2C
-#define I2C_MAX_RETRIES 3
-
-static bool i2c_initialized = false;
-
-static esp_err_t i2c_master_init(void)
-{
-    if (i2c_initialized) {
-        return ESP_OK;
-    }
+// Función para escribir 4 bits al expansor
+static void lcd_write_nibble(uint8_t nibble, uint8_t mode) {
+    uint8_t data = (nibble & 0xF0) | mode | LCD_BL; // Mantener Backlight ON
+    uint8_t packet[1];
     
-    int i2c_master_port = I2C_MASTER_NUM;
-    i2c_config_t conf = {
-        .mode = I2C_MODE_MASTER,
-        .sda_io_num = I2C_MASTER_SDA_IO,
-        .scl_io_num = I2C_MASTER_SCL_IO,
-        .sda_pullup_en = GPIO_PULLUP_ENABLE,
-        .scl_pullup_en = GPIO_PULLUP_ENABLE,
-        .master.clk_speed = I2C_MASTER_FREQ_HZ,
-    };
-    
-    esp_err_t err = i2c_param_config(i2c_master_port, &conf);
-    if (err != ESP_OK) {
-        ESP_LOGE(TAG, "Error configurando I2C: %s", esp_err_to_name(err));
-        return err;
-    }
-    
-    err = i2c_driver_install(i2c_master_port, conf.mode, I2C_MASTER_RX_BUF_DISABLE, I2C_MASTER_TX_BUF_DISABLE, 0);
-    if (err == ESP_OK) {
-        i2c_initialized = true;
-        ESP_LOGI(TAG, "I2C inicializado correctamente");
-    } else if (err == ESP_ERR_INVALID_STATE) {
-        // Driver ya instalado
-        i2c_initialized = true;
-        err = ESP_OK;
-    } else {
-        ESP_LOGE(TAG, "Error instalando driver I2C: %s", esp_err_to_name(err));
-    }
-    
-    return err;
+    // 1. Poner datos en el bus (Enable LOW)
+    packet[0] = data;
+    i2c_master_write_to_device(I2C_NUM, _addr, packet, 1, 100);
+    esp_rom_delay_us(50); // Pequeña espera para estabilizar
+
+    // 2. Pulse ENABLE HIGH (Latch)
+    packet[0] = data | LCD_EN;
+    i2c_master_write_to_device(I2C_NUM, _addr, packet, 1, 100);
+    esp_rom_delay_us(600); // El LCD necesita >450ns, le damos 600us por seguridad
+
+    // 3. Pulse ENABLE LOW
+    packet[0] = data; // EN=0
+    i2c_master_write_to_device(I2C_NUM, _addr, packet, 1, 100);
+    esp_rom_delay_us(100); 
 }
 
-// Envía un byte al PCF8574 con reintentos
-static esp_err_t lcd_write_byte(uint8_t data)
-{
-    esp_err_t err;
-    for (int retry = 0; retry < I2C_MAX_RETRIES; retry++) {
-        err = i2c_master_write_to_device(I2C_MASTER_NUM, LCD_ADDR, &data, 1, pdMS_TO_TICKS(50));
-        if (err == ESP_OK) {
-            return ESP_OK;
-        }
-        ets_delay_us(100);
-    }
-    ESP_LOGW(TAG, "Error I2C después de %d reintentos: %s", I2C_MAX_RETRIES, esp_err_to_name(err));
-    return err;
+static void lcd_send_byte(uint8_t val, uint8_t mode) {
+    // Enviar parte ALTA (High Nibble)
+    lcd_write_nibble(val & 0xF0, mode);
+    // Enviar parte BAJA (Low Nibble)
+    lcd_write_nibble(val << 4, mode);
 }
 
-// Genera pulso de Enable con timing preciso
-static esp_err_t lcd_pulse_enable(uint8_t data)
-{
-    esp_err_t err;
+void i2c_lcd_init(uint8_t addr) {
+    _addr = addr;
     
-    // Enable HIGH
-    err = lcd_write_byte(data | LCD_ENABLE);
-    if (err != ESP_OK) return err;
-    ets_delay_us(1);  // Enable pulse width >= 450ns
-    
-    // Enable LOW  
-    err = lcd_write_byte(data & ~LCD_ENABLE);
-    if (err != ESP_OK) return err;
-    ets_delay_us(50); // Tiempo para que el LCD procese el comando
-    
-    return ESP_OK;
-}
+    // Espera inicial fuerte para que suba el voltaje del LCD
+    vTaskDelay(pdMS_TO_TICKS(100));
 
-// Envía 4 bits al LCD (nibble)
-static esp_err_t lcd_send_nibble(uint8_t nibble, bool is_data)
-{
-    uint8_t data = (nibble & 0xF0) | LCD_BACKLIGHT;
-    if (is_data) {
-        data |= LCD_RS;  // RS=1 para datos
-    }
-    // RW siempre 0 (escritura)
+    // --- SECUENCIA DE RESET MÁGICA (Datasheet HD44780) ---
+    // Hay que enviarle 0x03 tres veces "a ciegas" para asegurar modo 8 bits
+    // antes de pasar a 4 bits.
     
-    return lcd_pulse_enable(data);
-}
-
-static esp_err_t lcd_send_cmd(char cmd)
-{
-    esp_err_t err;
+    lcd_write_nibble(0x30, LCD_RS_CMD);
+    vTaskDelay(pdMS_TO_TICKS(10)); // Esperar >4.1ms
     
-    // Nibble alto primero
-    err = lcd_send_nibble(cmd & 0xF0, false);
-    if (err != ESP_OK) return err;
+    lcd_write_nibble(0x30, LCD_RS_CMD);
+    vTaskDelay(pdMS_TO_TICKS(1));  // Esperar >100us
     
-    // Nibble bajo
-    err = lcd_send_nibble((cmd << 4) & 0xF0, false);
-    if (err != ESP_OK) return err;
-    
-    // Tiempo extra para comandos lentos (Clear, Home)
-    if (cmd == 0x01 || cmd == 0x02) {
-        ets_delay_us(2000);  // Clear y Home necesitan ~1.52ms
-    } else {
-        ets_delay_us(50);    // Otros comandos ~37us
-    }
-    
-    return ESP_OK;
-}
-
-static esp_err_t lcd_send_data(char data)
-{
-    esp_err_t err;
-    
-    // Nibble alto primero
-    err = lcd_send_nibble(data & 0xF0, true);
-    if (err != ESP_OK) return err;
-    
-    // Nibble bajo
-    err = lcd_send_nibble((data << 4) & 0xF0, true);
-    if (err != ESP_OK) return err;
-    
-    ets_delay_us(50);  // Tiempo para escribir en RAM
-    
-    return ESP_OK;
-}
-
-void lcd_init(void)
-{
-    esp_err_t err = i2c_master_init();
-    if (err != ESP_OK) {
-        ESP_LOGE(TAG, "Fallo inicialización I2C");
-        return;
-    }
-    
-    // Espera inicial larga (>40ms después de Vcc=2.7V) para estabilización
-    vTaskDelay(pdMS_TO_TICKS(100)); 
-
-    // === SECUENCIA DE INICIALIZACIÓN SEGÚN DATASHEET HD44780 ===
-    
-    // Paso 1: Esperar >15ms después de Vcc=4.5V
-    // (ya esperamos 100ms arriba)
-    
-    // Paso 2: Enviar 0x30 (Function Set 8-bit) - primera vez
-    // NOTA: En modo 4-bit, enviamos solo el nibble alto
-    lcd_write_byte(0x30 | LCD_BACKLIGHT);
-    lcd_pulse_enable(0x30 | LCD_BACKLIGHT);
-    vTaskDelay(pdMS_TO_TICKS(5));  // Esperar >4.1ms
-    
-    // Paso 3: Enviar 0x30 - segunda vez
-    lcd_write_byte(0x30 | LCD_BACKLIGHT);
-    lcd_pulse_enable(0x30 | LCD_BACKLIGHT);
-    ets_delay_us(150);  // Esperar >100us
-    
-    // Paso 4: Enviar 0x30 - tercera vez
-    lcd_write_byte(0x30 | LCD_BACKLIGHT);
-    lcd_pulse_enable(0x30 | LCD_BACKLIGHT);
-    ets_delay_us(150);
-    
-    // Paso 5: Cambiar a modo 4-bit (enviar 0x20)
-    lcd_write_byte(0x20 | LCD_BACKLIGHT);
-    lcd_pulse_enable(0x20 | LCD_BACKLIGHT);
-    ets_delay_us(150);
-    
-    // === AHORA ESTAMOS EN MODO 4-BIT ===
-    
-    // Function Set: 4-bit, 2 líneas, 5x8 puntos
-    lcd_send_cmd(0x28);
+    lcd_write_nibble(0x30, LCD_RS_CMD);
     vTaskDelay(pdMS_TO_TICKS(1));
-    
-    // Display OFF
-    lcd_send_cmd(0x08);
+
+    // Ahora sí, pasar a modo 4-bits
+    lcd_write_nibble(0x20, LCD_RS_CMD);
     vTaskDelay(pdMS_TO_TICKS(1));
+
+    // --- CONFIGURACIÓN FINAL ---
+    // Function Set: 4-bit, 2 lines, 5x8 font
+    lcd_send_byte(0x28, LCD_RS_CMD);
     
-    // Clear Display (tarda ~1.52ms)
-    lcd_send_cmd(0x01);
-    vTaskDelay(pdMS_TO_TICKS(5));
+    // Display Control: Display OFF, Cursor OFF, Blink OFF
+    lcd_send_byte(0x08, LCD_RS_CMD);
     
-    // Entry Mode: Incrementar cursor, sin shift
-    lcd_send_cmd(0x06);
-    vTaskDelay(pdMS_TO_TICKS(1));
+    // Clear Display
+    lcd_send_byte(0x01, LCD_RS_CMD);
+    vTaskDelay(pdMS_TO_TICKS(5)); // Clear tarda mucho (>2ms)
+
+    // Entry Mode: Increment cursor
+    lcd_send_byte(0x06, LCD_RS_CMD);
+
+    // Display ON
+    lcd_send_byte(0x0C, LCD_RS_CMD);
     
-    // Display ON, Cursor OFF, Blink OFF
-    lcd_send_cmd(0x0C);
-    vTaskDelay(pdMS_TO_TICKS(1));
-    
-    ESP_LOGI(TAG, "LCD inicializado correctamente (Secuencia HD44780)");
+    ESP_LOGI(TAG, "LCD Inicializado (Modo Lento)");
 }
 
-void lcd_send_string(const char *str)
-{
-    if (str == NULL) return;
+void i2c_lcd_clear(void) {
+    lcd_send_byte(0x01, LCD_RS_CMD);
+    vTaskDelay(pdMS_TO_TICKS(5)); // Importante esperar acá
+}
+
+void i2c_lcd_write_text(uint8_t row, uint8_t col, const char *text) {
+    // Mover cursor
+    uint8_t pos_addr;
+    // Mapeo para LCD 20x4 y 16x2 estándar
+    int row_offsets[] = { 0x00, 0x40, 0x14, 0x54 };
+    if (row > 3) row = 0;
     
-    while (*str) {
-        // Filtrar caracteres no imprimibles (solo ASCII 32-126)
-        char c = *str++;
-        if (c >= 32 && c <= 126) {
-            lcd_send_data(c);
-        } else if (c == '\n') {
-            // Salto de línea: mover a línea 2
-            lcd_set_cursor(1, 0);
-        }
-        // Pequeño delay entre caracteres para estabilidad
-        ets_delay_us(50);
+    pos_addr = 0x80 | (col + row_offsets[row]);
+    
+    lcd_send_byte(pos_addr, LCD_RS_CMD);
+
+    // Escribir cadena
+    while (*text) {
+        lcd_send_byte((uint8_t)(*text), LCD_RS_DATA);
+        text++;
     }
-}
-
-void lcd_set_cursor(int row, int col)
-{
-    // Validar límites
-    if (row < 0) row = 0;
-    if (row > 1) row = 1;
-    if (col < 0) col = 0;
-    if (col > 15) col = 15;
-    
-    // Direcciones DDRAM: Fila 0 = 0x00, Fila 1 = 0x40
-    uint8_t addr = (row == 0) ? 0x00 : 0x40;
-    addr += col;
-    lcd_send_cmd(0x80 | addr);  // Set DDRAM Address
-    ets_delay_us(50);
-}
-
-void lcd_clear(void)
-{
-    lcd_send_cmd(0x01);
-    vTaskDelay(pdMS_TO_TICKS(5)); // Clear necesita ~1.52ms mínimo
-}
-
-void lcd_home(void)
-{
-    lcd_send_cmd(0x02);
-    vTaskDelay(pdMS_TO_TICKS(5)); // Home necesita ~1.52ms mínimo
-}
-
-void lcd_backlight(bool on)
-{
-    uint8_t data = on ? LCD_BACKLIGHT : 0x00;
-    lcd_write_byte(data);
-}
-
-// Imprime un valor formateado de forma segura
-void lcd_printf(int row, int col, const char *format, ...)
-{
-    char buffer[LCD_COLS + 1];
-    va_list args;
-    va_start(args, format);
-    vsnprintf(buffer, sizeof(buffer), format, args);
-    va_end(args);
-    
-    lcd_set_cursor(row, col);
-    lcd_send_string(buffer);
 }
