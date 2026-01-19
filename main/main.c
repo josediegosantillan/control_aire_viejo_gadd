@@ -25,8 +25,9 @@ static const char *TAG = "MAIN_SYSTEM";
 // --- PINES ---
 #define PIN_ONEWIRE GPIO_NUM_4  
 
-// --- IDs SENSORES ---
-const ds18b20_addr_t ID_COIL = { {0x28, 0xBB, 0x88, 0xAF, 0x00, 0x00, 0x00, 0x27} };
+// --- IDs SENSORES (Asegurate que sean los que escaneaste) ---
+// Reemplaza estos valores si el escáner te dio otros distintos
+const ds18b20_addr_t ID_COIL = { {0x28, 0xF4, 0xD6, 0x57, 0x04, 0xE1, 0x3C, 0x1E} };
 const ds18b20_addr_t ID_AMB  = { {0x28, 0xB5, 0x6C, 0x54, 0x00, 0x00, 0x00, 0x14} };
 const ds18b20_addr_t ID_OUT  = { {0x28, 0xB9, 0x31, 0x55, 0x00, 0x00, 0x00, 0x9F} };
 
@@ -58,7 +59,7 @@ static esp_err_t i2c_master_init(void) {
         .scl_io_num = PIN_I2C_SCL, 
         .sda_pullup_en = GPIO_PULLUP_ENABLE,
         .scl_pullup_en = GPIO_PULLUP_ENABLE,
-        .master.clk_speed = 10000, 
+        .master.clk_speed = 10000, // 10kHz para máxima estabilidad
     };
     i2c_param_config(I2C_NUM_0, &conf);
     return i2c_driver_install(I2C_NUM_0, conf.mode, 0, 0, 0);
@@ -85,21 +86,21 @@ int get_wifi_status() {
     wifi_mode_t mode;
     if (esp_wifi_get_mode(&mode) != ESP_OK) return 0; 
 
-    if (mode == WIFI_MODE_APSTA) return 2; 
+    if (mode == WIFI_MODE_APSTA) return 2; // Modo Configuración
 
     if (mode == WIFI_MODE_STA) {
         esp_netif_t *netif = esp_netif_get_handle_from_ifkey("WIFI_STA_DEF");
         if (netif) {
             esp_netif_ip_info_t ip_info;
             if (esp_netif_get_ip_info(netif, &ip_info) == ESP_OK) {
-                if (ip_info.ip.addr != 0) return 1; 
+                if (ip_info.ip.addr != 0) return 1; // Conectado OK
             }
         }
     }
     return 0; 
 }
 
-// --- TAREA UI ---
+// --- TAREA UI (PANTALLA) ---
 void task_ui(void *pv) {
     char buffer[21]; 
     int error_count = 0;
@@ -109,11 +110,12 @@ void task_ui(void *pv) {
     i2c_lcd_init(I2C_lcd_addr);
     i2c_lcd_clear();
     
-    i2c_lcd_write_text(0, 0, "   GADD CLIMA v4.7  ");
+    i2c_lcd_write_text(0, 0, "   GADD CLIMA v5.0  ");
     vTaskDelay(pdMS_TO_TICKS(1500));
     i2c_lcd_clear();
 
     while(1) {
+        // 1. Auto-Curación LCD
         if (i2c_lcd_is_alive() != ESP_OK) {
             error_count++;
             if (error_count >= 3) {
@@ -133,8 +135,11 @@ void task_ui(void *pv) {
 
         int wifi_state = get_wifi_status();
 
-        // FILA 0
+        // 2. DIBUJAR PANTALLA
+        
+        // --- FILA 0 ---
         if (wifi_state == 2) {
+            // Nombre de la red para configurar
             i2c_lcd_write_text(0, 0, "Aire_Lennox_GaddBar "); 
         } 
         else if (sys.freeze_mode) {
@@ -154,7 +159,7 @@ void task_ui(void *pv) {
             i2c_lcd_write_text(0, 0, "SISTEMA APAGADO     ");
         }
 
-        // FILA 1
+        // --- FILA 1 ---
         char wifi_icon = '!';
         if (wifi_state == 1) wifi_icon = '*'; 
         else if (wifi_state == 2) wifi_icon = 'C'; 
@@ -166,58 +171,82 @@ void task_ui(void *pv) {
     }
 }
 
-// --- TAREA CLIMA ---
+// --- TAREA CLIMA (CONTROL + LECTURA SEGURA) ---
 void task_climate(void *pv) {
     ds18b20_init_bus(PIN_ONEWIRE);
     esp_task_wdt_add(NULL);
+    
+    float temp_reading = 0.0; // Variable temporal para validar
 
     while(1) {
-        // LEER SENSORES
+        // 1. LEER SENSORES
         if (ds18b20_convert_all(PIN_ONEWIRE) == ESP_OK) {
-            ds18b20_read_one(PIN_ONEWIRE, ID_AMB, &sys.t_amb);
-            ds18b20_read_one(PIN_ONEWIRE, ID_OUT, &sys.t_out);
-            ds18b20_read_one(PIN_ONEWIRE, ID_COIL, &sys.t_coil);
             
-            // --- NUEVO LOG COMPLETO ---
-            ESP_LOGI(TAG, "TERMOMETROS -> Amb: %.2f | Coil: %.2f | Out: %.2f", 
+            // --- AMBIENTE ---
+            if (ds18b20_read_one(PIN_ONEWIRE, ID_AMB, &temp_reading) == ESP_OK) {
+                // Filtro: Si da -0.0625 aprox, ignorar.
+                if (temp_reading > -0.07 && temp_reading < -0.05) {
+                    ESP_LOGW(TAG, "Glitch (-0.06) en AMB ignorado.");
+                } else {
+                    sys.t_amb = temp_reading;
+                }
+            }
+
+            // --- SALIDA ---
+            if (ds18b20_read_one(PIN_ONEWIRE, ID_OUT, &temp_reading) == ESP_OK) {
+                if (temp_reading > -0.07 && temp_reading < -0.05) {
+                    ESP_LOGW(TAG, "Glitch (-0.06) en OUT ignorado.");
+                } else {
+                    sys.t_out = temp_reading;
+                }
+            }
+
+            // --- COIL (CRÍTICO) ---
+            if (ds18b20_read_one(PIN_ONEWIRE, ID_COIL, &temp_reading) == ESP_OK) {
+                if (temp_reading > -0.07 && temp_reading < -0.05) {
+                    ESP_LOGW(TAG, ">>> GLITCH (-0.06) EN COIL - IGNORADO <<<");
+                    // NO actualizamos sys.t_coil, mantenemos el valor viejo
+                } else {
+                    sys.t_coil = temp_reading;
+                }
+            }
+            
+            // LOG DE CONTROL
+            ESP_LOGI(TAG, "Sensores -> Amb: %.2f | Coil: %.2f | Out: %.2f", 
                      sys.t_amb, sys.t_coil, sys.t_out);
+
         } else {
-            ESP_LOGE(TAG, "Error leyendo sensores DS18B20");
+            ESP_LOGE(TAG, "Error Bus OneWire (Fallo Convert All)");
         }
 
-        // LÓGICA DE CONTROL
+        // 2. LÓGICA DE CONTROL
         
-        // 1. Anti-Hielo
+        // A. Protección Anti-Hielo
         if (!sys.freeze_mode && sys.t_coil < FREEZE_LIMIT_C) {
-            ESP_LOGW(TAG, ">>> ALERTA DE HIELO DETECTADA (%.2f C) <<<", sys.t_coil);
-            ESP_LOGW(TAG, ">>> Apagando Compresor y forzando FAN al MAX <<<");
-            
+            ESP_LOGW(TAG, ">>> ALERTA DE HIELO REAL (%.2f C) <<<", sys.t_coil);
             sys.freeze_mode = true;
             sys.comp_active = false; 
-            set_relays(false, 3); // <--- ESTO ES LO QUE VISTE
+            set_relays(false, 3); // Apagar Compresor, Fan al MAX
             last_comp_stop_time = esp_timer_get_time();
         }
         else if (sys.freeze_mode) {
             if (sys.t_coil > FREEZE_RESET_C) {
-                ESP_LOGI(TAG, ">>> Hielo descongelado (%.2f C). Volviendo a normalidad.", sys.t_coil);
+                ESP_LOGI(TAG, "Hielo despejado. Sistema normalizado.");
                 sys.freeze_mode = false;
             }
         }
         
-        // 2. Control Normal
+        // B. Termostato Normal
         else if (sys.cfg.system_on) {
             if (sys.t_amb > (sys.cfg.setpoint + 1.0) && !sys.comp_active) {
                 if (is_safe_to_start()) {
-                    ESP_LOGI(TAG, "Demandando Frío. Encendiendo Compresor.");
                     sys.comp_active = true;
                     set_relays(true, sys.cfg.fan_speed);
                     sys.protection_wait = false;
                 } else {
-                    if (!sys.protection_wait) ESP_LOGI(TAG, "Esperando protección 3min...");
                     sys.protection_wait = true;
                 }
             } else if (sys.t_amb < (sys.cfg.setpoint - 1.0) && sys.comp_active) {
-                ESP_LOGI(TAG, "Setpoint alcanzado. Cortando Compresor.");
                 sys.comp_active = false;
                 set_relays(false, sys.cfg.fan_speed);
                 last_comp_stop_time = esp_timer_get_time();
@@ -228,11 +257,13 @@ void task_climate(void *pv) {
             sys.comp_active = false;
             set_relays(false, 0);
         }
+
         esp_task_wdt_reset();
         vTaskDelay(pdMS_TO_TICKS(1000));
     }
 }
 
+// --- TAREA MEDICIÓN ENERGÍA ---
 void task_meter(void *pv) {
     while(1) {
         ac_meter_read_rms(&sys.volt, &sys.amp, &sys.watt);
@@ -240,8 +271,9 @@ void task_meter(void *pv) {
     }
 }
 
+// --- MAIN APP ---
 void app_main(void) {
-    // 1. Iniciar NVS
+    // 1. Iniciar NVS (Obligatorio)
     esp_err_t ret = nvs_flash_init();
     if (ret == ESP_ERR_NVS_NO_FREE_PAGES || ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
         ESP_ERROR_CHECK(nvs_flash_erase());
@@ -259,18 +291,26 @@ void app_main(void) {
     gpio_reset_pin(PIN_FAN_H); gpio_set_direction(PIN_FAN_H, GPIO_MODE_OUTPUT);
     set_relays(false, 0);
 
-    sys.cfg.setpoint = 24.0;
+    // Configuración Inicial
+    sys.cfg.setpoint = 10.0;
     sys.cfg.fan_speed = 1;
     sys.cfg.system_on = true;
+    // Inicializamos temperaturas en valores seguros para que no dispare alarmas al arrancar
+    sys.t_amb = 25.0; 
+    sys.t_coil = 20.0;
+    sys.t_out = 20.0;
 
-    // 3. INICIAR TU PORTAL WEB
+    // 3. INICIAR PORTAL WIFI
     wifi_portal_init(); 
     
     // Watchdog
     esp_task_wdt_config_t wdt_conf = { .timeout_ms = WDT_TIMEOUT_MS, .trigger_panic = true };
     if (esp_task_wdt_status(NULL) != ESP_OK) esp_task_wdt_init(&wdt_conf);
     
+    // Tareas
     xTaskCreate(task_climate, "Climate", 4096, NULL, 5, NULL);
     xTaskCreate(task_meter, "Meter", 4096, NULL, 3, NULL);
     xTaskCreate(task_ui, "UI", 4096, NULL, 2, NULL);
+    
+    ESP_LOGI(TAG, "Sistema Arrancado. Version 5.0 Stable");
 }
