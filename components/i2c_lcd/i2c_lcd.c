@@ -1,150 +1,104 @@
 #include "i2c_lcd.h"
-#include "driver/i2c.h"
 #include "esp_log.h"
-#include "freertos/FreeRTOS.h"
-#include "freertos/task.h"
-#include "esp_rom_sys.h" // Vital para retardos precisos en microsegundos
+#include "driver/i2c.h"
+#include <unistd.h>
 
-static const char *TAG = "LCD";
-#define I2C_NUM I2C_NUM_0
-
-// Almacena la dirección I2C (0x27 o 0x3F)
+static const char *TAG = "I2C_LCD";
 static uint8_t _addr;
 
-// Máscaras de bits estándar para el chip PCF8574
-// P0=RS, P1=RW, P2=EN, P3=Backlight, P4-P7=Datos
-#define LCD_RS_CMD 0x00
-#define LCD_RS_DATA 0x01
-#define LCD_RW     0x02
-#define LCD_EN     0x04
-#define LCD_BL     0x08 // Backlight ON
+// Comandos LCD
+#define LCD_CLEARDISPLAY 0x01
+#define LCD_RETURNHOME 0x02
+#define LCD_ENTRYMODESET 0x04
+#define LCD_DISPLAYCONTROL 0x08
+#define LCD_CURSORSHIFT 0x10
+#define LCD_FUNCTIONSET 0x20
+#define LCD_SETCGRAMADDR 0x40
+#define LCD_SETDDRAMADDR 0x80
 
-// --- FUNCIONES PRIVADAS (Low Level) ---
+// Flags display
+#define LCD_DISPLAYON 0x04
+#define LCD_BACKLIGHT 0x08
+#define LCD_ENABLE_BIT 0x04
+#define LCD_RW_BIT 0x02 
+#define LCD_RS_BIT 0x01 
 
-/**
- * @brief Envía 4 bits al LCD manejando el pulso de Enable manualmente.
- * Esta versión es "lenta" a propósito para evitar errores por ruido o cables largos.
- */
-static void lcd_write_nibble(uint8_t nibble, uint8_t mode) {
-    uint8_t data = (nibble & 0xF0) | mode | LCD_BL;
-    uint8_t packet[1];
-    
-    // 1. Preparar datos en el bus (Enable LOW)
-    packet[0] = data;
-    i2c_master_write_to_device(I2C_NUM, _addr, packet, 1, 100);
-    esp_rom_delay_us(50); // Tiempo de setup
-
-    // 2. Pulso Enable HIGH
-    packet[0] = data | LCD_EN;
-    i2c_master_write_to_device(I2C_NUM, _addr, packet, 1, 100);
-    esp_rom_delay_us(600); // Mantenemos el pulso 600us (El LCD requiere >450ns, exageramos por seguridad)
-
-    // 3. Pulso Enable LOW (Latch)
-    packet[0] = data; 
-    i2c_master_write_to_device(I2C_NUM, _addr, packet, 1, 100);
-    esp_rom_delay_us(50); // Tiempo de hold
-}
-
-/**
- * @brief Envía un byte completo dividiéndolo en dos nibbles (Alto y Bajo)
- */
-static void lcd_send_byte(uint8_t val, uint8_t mode) {
-    lcd_write_nibble(val & 0xF0, mode); // Enviar 4 bits altos
-    lcd_write_nibble(val << 4, mode);   // Enviar 4 bits bajos
-}
-
-// --- FUNCIONES PÚBLICAS (API) ---
-
-/**
- * @brief Verifica si el LCD responde al bus (Ping)
- */
-esp_err_t i2c_lcd_is_alive(void) {
+static esp_err_t i2c_lcd_write_byte(uint8_t val) {
     i2c_cmd_handle_t cmd = i2c_cmd_link_create();
     i2c_master_start(cmd);
-    
-    // Intentamos escribir la dirección. Si el chip existe, devuelve ACK.
     i2c_master_write_byte(cmd, (_addr << 1) | I2C_MASTER_WRITE, true);
-    
+    i2c_master_write_byte(cmd, val | LCD_BACKLIGHT, true);
     i2c_master_stop(cmd);
-    
-    // Ejecutamos con timeout corto (50ms)
-    esp_err_t ret = i2c_master_cmd_begin(I2C_NUM, cmd, 50 / portTICK_PERIOD_MS);
+    esp_err_t ret = i2c_master_cmd_begin(I2C_NUM_0, cmd, pdMS_TO_TICKS(100));
     i2c_cmd_link_delete(cmd);
-    
     return ret;
 }
 
-/**
- * @brief Inicialización completa con secuencia de Reset de fábrica
- */
+static void i2c_lcd_pulse_enable(uint8_t val) {
+    i2c_lcd_write_byte(val | LCD_ENABLE_BIT);
+    usleep(1);
+    i2c_lcd_write_byte(val & ~LCD_ENABLE_BIT);
+    usleep(50);
+}
+
+static void i2c_lcd_write_nibble(uint8_t val, uint8_t mode) {
+    uint8_t high = val & 0xF0;
+    i2c_lcd_write_byte(high | mode);
+    i2c_lcd_pulse_enable(high | mode);
+}
+
+static void i2c_lcd_send_byte(uint8_t val, uint8_t mode) {
+    uint8_t high = val & 0xF0;
+    uint8_t low = (val << 4) & 0xF0;
+    i2c_lcd_write_byte(high | mode);
+    i2c_lcd_pulse_enable(high | mode);
+    i2c_lcd_write_byte(low | mode);
+    i2c_lcd_pulse_enable(low | mode);
+}
+
 void i2c_lcd_init(uint8_t addr) {
     _addr = addr;
+    usleep(50000);
     
-    // Espera inicial para que se estabilice el voltaje del LCD
-    vTaskDelay(pdMS_TO_TICKS(100));
+    i2c_lcd_write_nibble(0x30, 0); usleep(4500);
+    i2c_lcd_write_nibble(0x30, 0); usleep(4500);
+    i2c_lcd_write_nibble(0x30, 0); usleep(150);
+    i2c_lcd_write_nibble(0x20, 0); 
 
-    // --- SECUENCIA DE RESET MÁGICA (Datasheet HD44780) ---
-    // Esto descongela al LCD si quedó en un estado intermedio
-    lcd_write_nibble(0x30, LCD_RS_CMD);
-    vTaskDelay(pdMS_TO_TICKS(10)); // Esperar >4.1ms
-    
-    lcd_write_nibble(0x30, LCD_RS_CMD);
-    vTaskDelay(pdMS_TO_TICKS(1));  // Esperar >100us
-    
-    lcd_write_nibble(0x30, LCD_RS_CMD);
-    vTaskDelay(pdMS_TO_TICKS(1));
-
-    // Pasar a modo 4-bits
-    lcd_write_nibble(0x20, LCD_RS_CMD);
-    vTaskDelay(pdMS_TO_TICKS(1));
-
-    // --- CONFIGURACIÓN DE PANTALLA ---
-    // Function Set: 4-bit, 2 lineas, fuente 5x8
-    lcd_send_byte(0x28, LCD_RS_CMD);
-    
-    // Display Control: Apagar pantalla
-    lcd_send_byte(0x08, LCD_RS_CMD);
-    
-    // Clear Display: Borrar todo
-    lcd_send_byte(0x01, LCD_RS_CMD);
-    vTaskDelay(pdMS_TO_TICKS(10)); // Clear tarda bastante, damos 10ms
-    
-    // Entry Mode: Incrementar cursor a la derecha
-    lcd_send_byte(0x06, LCD_RS_CMD);
-
-    // Display Control: Prender pantalla, sin cursor, sin parpadeo
-    lcd_send_byte(0x0C, LCD_RS_CMD);
-    
-    ESP_LOGI(TAG, "LCD Inicializado OK (Dir: 0x%02X)", addr);
+    i2c_lcd_send_byte(0x28, 0); 
+    i2c_lcd_send_byte(0x0C, 0); 
+    i2c_lcd_send_byte(0x06, 0); 
+    i2c_lcd_send_byte(0x01, 0); 
+    usleep(2000);
 }
 
-/**
- * @brief Borra la pantalla
- */
-void i2c_lcd_clear(void) {
-    lcd_send_byte(0x01, LCD_RS_CMD);
-    vTaskDelay(pdMS_TO_TICKS(5)); // Espera obligatoria
-}
-
-/**
- * @brief Escribe texto en la posición indicada
- */
+// --- CORRECCIÓN AQUÍ: uint8_t en lugar de int ---
 void i2c_lcd_write_text(uint8_t row, uint8_t col, const char *text) {
-    // Mapa de memoria para LCDs 16x2 y 20x4
+    // Direcciones para 20x4
     int row_offsets[] = { 0x00, 0x40, 0x14, 0x54 };
     
-    // Protección contra filas inexistentes
-    if (row > 3) row = 0;
-    
-    // 0x80 es el comando para "Set DDRAM Address"
-    uint8_t pos_addr = 0x80 | (col + row_offsets[row]);
-    
-    // Mover cursor
-    lcd_send_byte(pos_addr, LCD_RS_CMD);
+    if (row > 3) row = 3;
+    if (col > 19) col = 19;
 
-    // Escribir caracter por caracter
+    i2c_lcd_send_byte(LCD_SETDDRAMADDR | (col + row_offsets[row]), 0);
+    
     while (*text) {
-        lcd_send_byte((uint8_t)(*text), LCD_RS_DATA);
+        i2c_lcd_send_byte((uint8_t)(*text), LCD_RS_BIT);
         text++;
     }
+}
+
+void i2c_lcd_clear(void) {
+    i2c_lcd_send_byte(LCD_CLEARDISPLAY, 0);
+    usleep(2000);
+}
+
+esp_err_t i2c_lcd_is_alive(void) {
+    i2c_cmd_handle_t cmd = i2c_cmd_link_create();
+    i2c_master_start(cmd);
+    i2c_master_write_byte(cmd, (_addr << 1) | I2C_MASTER_WRITE, true);
+    i2c_master_stop(cmd);
+    esp_err_t ret = i2c_master_cmd_begin(I2C_NUM_0, cmd, pdMS_TO_TICKS(50));
+    i2c_cmd_link_delete(cmd);
+    return ret;
 }

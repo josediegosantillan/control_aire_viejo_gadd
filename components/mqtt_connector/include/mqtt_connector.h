@@ -3,9 +3,9 @@
 #include <stdbool.h>
 
 // Definiciones de Tópicos (Idealmente esto iría en Kconfig, pero hardcodeamos por ahora)
-#define MQTT_TOPIC_TELEMETRY "heladera/telemetria"
-#define MQTT_TOPIC_STATUS    "heladera/estado"
-#define MQTT_TOPIC_CONFIG   "heladera/config"
+#define MQTT_TOPIC_TELEMETRY "aire_lennox/telemetria"
+#define MQTT_TOPIC_STATUS    "aire_lennox/estado"
+#define MQTT_TOPIC_CONFIG   "aire_lennox/config"
 
 
 typedef void (*mqtt_rx_cb_t)(const char *topic, int topic_len,
