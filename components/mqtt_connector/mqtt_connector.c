@@ -38,7 +38,7 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_
         
         // Al conectar, nos suscribimos a comandos y avisamos que estamos ONLINE
         esp_mqtt_client_publish(event->client, MQTT_TOPIC_STATUS, "ONLINE", 0, 1, 1);
-        // esp_mqtt_client_subscribe(event->client, MQTT_TOPIC_CONFIG, 1); // Descomentar si recibes configuración
+        esp_mqtt_client_subscribe(event->client, MQTT_TOPIC_CONFIG, 1); // Descomentar si recibes configuración
         break;
 
     case MQTT_EVENT_DISCONNECTED:

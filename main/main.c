@@ -7,6 +7,8 @@
 #include "esp_task_wdt.h" 
 #include "driver/gpio.h"
 #include "driver/i2c.h"
+#include "cJSON.h"
+#include "ac_storage.h"
 
 // Librerías
 #include "esp_wifi.h"       
@@ -154,8 +156,8 @@ void task_climate(void *pv) {
             // Publicar MQTT
             if (mqtt_app_is_connected()) {
                 snprintf(json, sizeof(json), 
-                    "{\"v\":%.1f,\"a\":%.2f,\"amb\":%.2f,\"coil\":%.2f,\"on\":%d}", 
-                    sys.volt, sys.amp, sys.t_amb, sys.t_coil, sys.comp_active);
+                    "{\"v\":%.1f,\"a\":%.2f,\"amb\":%.2f,\"out\":%.2f,\"coil\":%.2f,\"on\":%d,\"fan\":%d}", 
+                    sys.volt, sys.amp, sys.t_amb, sys.t_out, sys.t_coil, sys.comp_active, sys.cfg.fan_speed);
                 mqtt_app_publish(MQTT_TOPIC_TELEMETRY, json);
             }
         }
@@ -191,10 +193,46 @@ void task_climate(void *pv) {
     }
 }
 
+// --- TAREA MEDICIÓN ENERGÍA (CON FILTRO) ---
+// --- TAREA MEDICIÓN ENERGÍA (CON FILTRO + LOG SERIAL) ---
 void task_meter(void *pv) {
+    float v_inst = 0.0, i_inst = 0.0, w_inst = 0.0;
+    
+    // Variable estática: guarda el valor anterior en memoria
+    static float v_ema = 0.0; 
+
+    // FACTOR DE SUAVIZADO (Alpha)
+    // 0.10 = Muy lento y estable (como un tester lento)
+    // 0.20 = Reacción media (Recomendado)
+    // 1.00 = Sin filtro (Saltos bruscos)
+    const float alpha = 0.10; 
+
     while(1) {
-        ac_meter_read_rms(&sys.volt, &sys.amp, &sys.watt);
-        vTaskDelay(pdMS_TO_TICKS(200)); // Muestreo continuo
+        // 1. Leer valor instantáneo del sensor (Raw)
+        ac_meter_read_rms(&v_inst, &i_inst, &w_inst);
+        
+        // 2. ALGORITMO DE FILTRADO (Exponential Moving Average)
+        if (v_ema == 0.0) {
+            v_ema = v_inst; // Inicialización rápida al arrancar
+        } else {
+            // Fórmula: NuevoPromedio = (Factor * LecturaActual) + ((1 - Factor) * PromedioAnterior)
+            v_ema = (alpha * v_inst) + ((1.0 - alpha) * v_ema);
+        }
+
+        // 3. Compuerta de Ruido (Noise Gate)
+        // Si el promedio baja de 15V, asumimos que está apagado o desconectado
+        if (v_ema < 15.0) v_ema = 0.0;
+        
+        // 4. Actualizar Variables Globales (Lo que ve el LCD y MQTT)
+        sys.volt = v_ema;   // Usamos el valor filtrado
+        sys.amp = i_inst;
+        sys.watt = w_inst;
+
+        // 5. IMPRIMIR EN SERIAL (Para depuración)
+        // Muestra: Voltaje Crudo vs Voltaje Filtrado
+        ESP_LOGI(TAG, "⚡ Raw: %5.1f V | Filtrado: %5.1f V | Amp: %.2f A", v_inst, sys.volt, sys.amp);
+
+        vTaskDelay(pdMS_TO_TICKS(250)); // 4 lecturas por segundo
     }
 }
 

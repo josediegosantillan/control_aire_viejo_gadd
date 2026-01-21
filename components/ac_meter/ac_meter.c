@@ -15,7 +15,7 @@ static const char *TAG = "AC_METER";
 
 // CALIBRACIÓN (Ajustar con Multímetro)
 // Si mide de más, bajar este número. Si mide de menos, subirlo.
-#define CAL_V 0.525 
+#define CAL_V 0.773
 #define CAL_I 0.040
 
 static adc_oneshot_unit_handle_t adc1_handle;
