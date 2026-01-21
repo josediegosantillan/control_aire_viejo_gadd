@@ -16,7 +16,7 @@ static const char *TAG = "AC_METER";
 // CALIBRACIÓN (Ajustar con Multímetro)
 // Si mide de más, bajar este número. Si mide de menos, subirlo.
 #define CAL_V 0.773
-#define CAL_I 0.040
+#define CAL_I 0.024
 
 static adc_oneshot_unit_handle_t adc1_handle;
 static adc_channel_t chan_v;
@@ -35,7 +35,7 @@ void ac_meter_init(int pin_v, int pin_i) {
     // 2. Configurar Voltaje (GPIO 34)
     ESP_ERROR_CHECK(adc_oneshot_io_to_channel(pin_v, &unit, &chan));
     chan_v = chan;
-
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                            
     // 3. Configurar Corriente (GPIO 35)
     ESP_ERROR_CHECK(adc_oneshot_io_to_channel(pin_i, &unit, &chan));
     chan_i = chan;
@@ -53,17 +53,24 @@ void ac_meter_init(int pin_v, int pin_i) {
 
 void ac_meter_read_rms(float *v, float *i, float *w) {
     int raw_v = 0;
+    int raw_i = 0;
     double sum_sq_v = 0.0;
     double sum_v = 0.0;
+    double sum_sq_i = 0.0;
+    double sum_i = 0.0;
     int samples = 0;
 
     int64_t start_time = esp_timer_get_time();
     
     // Muestreo de 200ms (10 ciclos de red)
     while ((esp_timer_get_time() - start_time) < 200000) {
-        if (adc_oneshot_read(adc1_handle, chan_v, &raw_v) == ESP_OK) {
+        if (adc_oneshot_read(adc1_handle, chan_v, &raw_v) == ESP_OK &&
+            adc_oneshot_read(adc1_handle, chan_i, &raw_i) == ESP_OK) {
             sum_v += raw_v;
             sum_sq_v += (raw_v * raw_v);
+            
+            sum_i += raw_i;
+            sum_sq_i += (raw_i * raw_i);
             samples++;
         }
     }
@@ -80,10 +87,21 @@ void ac_meter_read_rms(float *v, float *i, float *w) {
         if (rms_adc < 8.0) rms_adc = 0.0;
 
         *v = rms_adc * CAL_V;
+
+        // Cálculo RMS Corriente
+        double mean_i = sum_i / samples;
+        double variance_i = (sum_sq_i / samples) - (mean_i * mean_i);
+        if (variance_i < 0) variance_i = 0;
+
+        float rms_i_adc = sqrt(variance_i);
+        // Filtro de ruido más agresivo para corriente (umbral mayor para eliminar ruido sin carga)
+        if (rms_i_adc < 35.0) rms_i_adc = 0.0;
+
+        *i = rms_i_adc * CAL_I;
     } else {
         *v = 0.0;
+        *i = 0.0;
     }
 
-    *i = 0.0; // Corriente pendiente
     *w = (*v) * (*i); 
 }
