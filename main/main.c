@@ -113,17 +113,23 @@ void mqtt_data_handler(const char *topic, int topic_len, const char *data, int d
                 // Actualizar variables globales
                 if (j_on) {
                     sys.cfg.system_on = cJSON_IsTrue(j_on);
-                    ESP_LOGI(TAG, "CMD: Sistema %s", sys.cfg.system_on ? "ON" : "OFF");
+                    ESP_LOGI(TAG, "📡 Node-RED CMD: Sistema %s", sys.cfg.system_on ? "ON" : "OFF");
                 }
                 
                 if (j_fan) {
                     int speed = j_fan->valueint;
-                    if (speed >= 0 && speed <= 3) sys.cfg.fan_speed = speed;
+                    if (speed >= 0 && speed <= 3) {
+                        sys.cfg.fan_speed = speed;
+                        ESP_LOGI(TAG, "📡 Node-RED CMD: Velocidad Fan = %d", speed);
+                    }
                 }
 
                 if (j_sp) {
                     float sp = j_sp->valuedouble;
-                    if (sp >= 16.0 && sp <= 30.0) sys.cfg.setpoint = sp;
+                    if (sp >= 16.0 && sp <= 30.0) {
+                        sys.cfg.setpoint = sp;
+                        ESP_LOGI(TAG, "📡 Node-RED CMD: Temp. Objetivo = %.1f°C", sp);
+                    }
                 }
 
                 // Guardar en Flash para que no se borre al reiniciar
@@ -213,16 +219,12 @@ void task_ui(void *pv) {
 void task_climate(void *pv) {
     ds18b20_init_bus(PIN_ONEWIRE);
     esp_task_wdt_add(NULL);
-    float t_read = 0.0;
     char json[150];
 
     while(1) {
         // 1. Lectura Sensores (Lenta, afuera del mutex)
         if (ds18b20_convert_all(PIN_ONEWIRE) == ESP_OK) {
             float ta=0, to=0, tc=0;
-            if (ds18b20_read_one(PIN_ONEWIRE, ID_AMB, &ta) == ESP_OK) t_read=ta; 
-            // Truco: leemos en variables locales primero
-            if (ds18b20_read_one(PIN_ONEWIRE, ID_AMB, &ta) == ESP_OK) {}; // Dummy read fix
             ds18b20_read_one(PIN_ONEWIRE, ID_AMB, &ta);
             ds18b20_read_one(PIN_ONEWIRE, ID_OUT, &to);
             ds18b20_read_one(PIN_ONEWIRE, ID_COIL, &tc);
@@ -259,8 +261,15 @@ void task_climate(void *pv) {
                 
                 // Armar JSON para enviar (con datos consistentes)
                 snprintf(json, sizeof(json), 
-                    "{\"v\":%.1f,\"a\":%.2f,\"amb\":%.2f,\"coil\":%.2f,\"on\":%d,\"fan\":%d}", 
-                    sys.volt, sys.amp, sys.t_amb, sys.t_coil, sys.comp_active, sys.cfg.fan_speed);
+                    "{\"v\":%.1f,\"a\":%.2f,\"amb\":%.2f,\"out\":%.2f,\"coil\":%.2f,\"on\":%d,\"fan\":%d}", 
+                    sys.volt, sys.amp, sys.t_amb, sys.t_out, sys.t_coil, sys.comp_active, sys.cfg.fan_speed);
+                
+                // 📊 LOG COMPLETO DEL SISTEMA
+                ESP_LOGI(TAG, "═══════════════════════════════════════════════════════════");
+                ESP_LOGI(TAG, "⚡ Tensión: %.1fV | Intensidad: %.2fA | Potencia: %.0fW", sys.volt, sys.amp, sys.watt);
+                ESP_LOGI(TAG, "🌡️  T.Ambiente: %.1f°C | T.Cañería: %.1f°C | T.Exterior: %.1f°C", sys.t_amb, sys.t_coil, sys.t_out);
+                ESP_LOGI(TAG, "🎯 Objetivo: %.1f°C | Fan: %d | Compresor: %s", sys.cfg.setpoint, sys.cfg.fan_speed, sys.comp_active?"ON":"OFF");
+                ESP_LOGI(TAG, "═══════════════════════════════════════════════════════════");
                 
                 xSemaphoreGive(xMutexSys); // 🔓
             }

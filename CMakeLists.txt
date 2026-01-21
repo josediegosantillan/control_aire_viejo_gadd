@@ -12,4 +12,6 @@ set(EXTRA_COMPONENT_DIRS
 )
 # "Trim" the build. Include the minimal set of components, main, and anything it depends on.
 idf_build_set_property(MINIMAL_BUILD ON)
+# Use custom partition table
+set(PARTITION_CSV_PATH ${CMAKE_CURRENT_SOURCE_DIR}/partitions.csv)
 project(control_aire_acondicinado)
