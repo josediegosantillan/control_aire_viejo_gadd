@@ -2,49 +2,56 @@
 #include <string.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "freertos/semphr.h" // 👈 Mutex para seguridad
 #include "esp_log.h"
 #include "esp_timer.h"
 #include "esp_task_wdt.h" 
 #include "driver/gpio.h"
 #include "driver/i2c.h"
-#include "cJSON.h"
-#include "ac_storage.h"
 
 // Librerías
 #include "esp_wifi.h"       
 #include "esp_netif.h"      
 #include "nvs_flash.h"       
-#include "wifi_portal.h"    
+#include "cJSON.h"           // 👈 Para leer las órdenes de Node-RED
 
 // Componentes
+#include "wifi_portal.h"    
 #include "ac_config.h"      
-#include "ac_meter.h"       
+#include "ac_meter.h" 
+#include "ac_storage.h"      // 👈 Para guardar config (Persistence)      
 #include "ds18b20.h"        
 #include "i2c_lcd.h"
-#include "mqtt_connector.h" // <--- MQTT INTEGRADO
+#include "mqtt_connector.h" 
 
 static const char *TAG = "MAIN_SYSTEM";
 
 // --- PINES ---
 #define PIN_ONEWIRE GPIO_NUM_4  
-#define PIN_ZMPT    GPIO_NUM_34 // Sensor Voltaje
-#define PIN_SCT     GPIO_NUM_35 // Sensor Corriente
+#define PIN_ZMPT    GPIO_NUM_34 
+#define PIN_SCT     GPIO_NUM_35 
 
-// IDs Sensores
+// IDs Sensores (Hardcodeados)
 const ds18b20_addr_t ID_COIL = { {0x28, 0xF4, 0xD6, 0x57, 0x04, 0xE1, 0x3C, 0x1E} };
 const ds18b20_addr_t ID_AMB  = { {0x28, 0xB5, 0x6C, 0x54, 0x00, 0x00, 0x00, 0x14} };
 const ds18b20_addr_t ID_OUT  = { {0x28, 0xB9, 0x31, 0x55, 0x00, 0x00, 0x00, 0x9F} };
 
+// Mutex para proteger la variable sys
+static SemaphoreHandle_t xMutexSys = NULL;
+
 struct SystemState {
     float t_amb, t_out, t_coil;
     float volt, amp, watt;
-    struct { float setpoint; int fan_speed; bool system_on; } cfg;
+    
+    // Configuración persistente (coincide con ac_storage.h)
+    sys_config_t cfg; 
+    
     bool comp_active, freeze_mode, protection_wait;
 } sys;
 
 int64_t last_comp_stop_time = - (SAFETY_DELAY_MIN * 60 * 1000000LL);
 
-// --- I2C ---
+// --- AUXILIARES ---
 static esp_err_t i2c_master_init(void) {
     i2c_config_t conf = {
         .mode = I2C_MODE_MASTER,
@@ -58,7 +65,6 @@ static esp_err_t i2c_master_init(void) {
     return i2c_driver_install(I2C_NUM_0, conf.mode, 0, 0, 0);
 }
 
-// --- AUXILIARES ---
 bool is_safe_to_start() {
     int64_t now = esp_timer_get_time();
     int64_t safe_time = SAFETY_DELAY_MIN * 60 * 1000000LL;
@@ -88,10 +94,68 @@ int get_wifi_status() {
     return 0; 
 }
 
+// --- 📡 CALLBACK DE RECEPCIÓN MQTT (El cerebro que faltaba) ---
+void mqtt_data_handler(const char *topic, int topic_len, const char *data, int data_len) {
+    // Verificar tópico
+    if (strncmp(topic, MQTT_TOPIC_CONFIG, topic_len) == 0) {
+        ESP_LOGI(TAG, "📩 Orden recibida: %.*s", data_len, data);
+
+        cJSON *root = cJSON_ParseWithLength(data, data_len);
+        if (root) {
+            // Extraer datos del JSON de Node-RED
+            cJSON *j_on = cJSON_GetObjectItem(root, "on");
+            cJSON *j_fan = cJSON_GetObjectItem(root, "fan");
+            cJSON *j_sp = cJSON_GetObjectItem(root, "sp");
+
+            // 🛡️ ZONA SEGURA (MUTEX)
+            if (xSemaphoreTake(xMutexSys, pdMS_TO_TICKS(200)) == pdTRUE) {
+                
+                // Actualizar variables globales
+                if (j_on) {
+                    sys.cfg.system_on = cJSON_IsTrue(j_on);
+                    ESP_LOGI(TAG, "CMD: Sistema %s", sys.cfg.system_on ? "ON" : "OFF");
+                }
+                
+                if (j_fan) {
+                    int speed = j_fan->valueint;
+                    if (speed >= 0 && speed <= 3) sys.cfg.fan_speed = speed;
+                }
+
+                if (j_sp) {
+                    float sp = j_sp->valuedouble;
+                    if (sp >= 16.0 && sp <= 30.0) sys.cfg.setpoint = sp;
+                }
+
+                // Guardar en Flash para que no se borre al reiniciar
+                storage_save(&sys.cfg);
+
+                // Copiar estados para actuar YA (sin bloquear mutex)
+                bool current_on = sys.cfg.system_on;
+                int current_fan = sys.cfg.fan_speed;
+                bool comp_state = sys.comp_active;
+
+                xSemaphoreGive(xMutexSys); // 🔓 Liberar
+
+                // Aplicar cambios físicos inmediatos
+                if (!current_on) {
+                    set_relays(false, 0); // Apagar todo
+                } else {
+                    set_relays(comp_state, current_fan); // Actualizar ventilador, mantener compresor
+                }
+
+            } else {
+                ESP_LOGW(TAG, "⚠️ Sistema ocupado, ignorando comando MQTT");
+            }
+            cJSON_Delete(root);
+        }
+    }
+}
+
 // --- UI 20x4 ---
 void task_ui(void *pv) {
-    char buffer[32]; // Buffer grande
-    
+    char buffer[32];
+    struct SystemState sys_copy; // Copia local para no trabar el sistema
+
     i2c_master_init();
     i2c_lcd_init(I2C_lcd_addr);
     i2c_lcd_clear();
@@ -107,27 +171,33 @@ void task_ui(void *pv) {
             i2c_lcd_init(I2C_lcd_addr);
         }
 
+        // 📸 FOTO INSTANTÁNEA DE LOS DATOS (Thread-Safe)
+        if (xSemaphoreTake(xMutexSys, pdMS_TO_TICKS(100)) == pdTRUE) {
+            memcpy(&sys_copy, &sys, sizeof(struct SystemState));
+            xSemaphoreGive(xMutexSys);
+        }
+
         int wifi_state = get_wifi_status();
         bool mqtt_ok = mqtt_app_is_connected(); 
 
         // Renglón 0
-        if (sys.freeze_mode) i2c_lcd_write_text(0, 0, "ALERTA: CONGELADO!  ");
-        else if (sys.protection_wait) {
+        if (sys_copy.freeze_mode) i2c_lcd_write_text(0, 0, "ALERTA: CONGELADO!  ");
+        else if (sys_copy.protection_wait) {
              int wait = (SAFETY_DELAY_MIN * 60) - ((esp_timer_get_time() - last_comp_stop_time) / 1000000);
              if (wait < 0) wait = 0;
              snprintf(buffer, 32, "ESPERA: %ds          ", wait);
              i2c_lcd_write_text(0, 0, buffer);
-        } else if (sys.cfg.system_on) {
-             snprintf(buffer, 32, "FRIO:%s FAN:%d SP:%.0f", sys.comp_active?"ON ":"OFF", sys.cfg.fan_speed, sys.cfg.setpoint);
+        } else if (sys_copy.cfg.system_on) {
+             snprintf(buffer, 32, "FRIO:%s FAN:%d SP:%.0f", sys_copy.comp_active?"ON ":"OFF", sys_copy.cfg.fan_speed, sys_copy.cfg.setpoint);
              i2c_lcd_write_text(0, 0, buffer);
         } else i2c_lcd_write_text(0, 0, "SISTEMA APAGADO     ");
 
         // Renglón 1
-        snprintf(buffer, 32, "Amb:%.1f  Coil:%.1f ", sys.t_amb, sys.t_coil);
+        snprintf(buffer, 32, "Amb:%.1f  Coil:%.1f ", sys_copy.t_amb, sys_copy.t_coil);
         i2c_lcd_write_text(1, 0, buffer);
 
-        // Renglón 2 (Voltaje Real)
-        snprintf(buffer, 32, "%.1fV %.1fA %.0fW    ", sys.volt, sys.amp, sys.watt);
+        // Renglón 2
+        snprintf(buffer, 32, "%.1fV %.1fA %.0fW    ", sys_copy.volt, sys_copy.amp, sys_copy.watt);
         i2c_lcd_write_text(2, 0, buffer);
 
         // Renglón 3
@@ -147,45 +217,58 @@ void task_climate(void *pv) {
     char json[150];
 
     while(1) {
+        // 1. Lectura Sensores (Lenta, afuera del mutex)
         if (ds18b20_convert_all(PIN_ONEWIRE) == ESP_OK) {
-            // Lecturas seguras
-            if (ds18b20_read_one(PIN_ONEWIRE, ID_AMB, &t_read) == ESP_OK) sys.t_amb = t_read;
-            if (ds18b20_read_one(PIN_ONEWIRE, ID_OUT, &t_read) == ESP_OK) sys.t_out = t_read;
-            if (ds18b20_read_one(PIN_ONEWIRE, ID_COIL, &t_read) == ESP_OK) sys.t_coil = t_read;
-            
-            // Publicar MQTT
-            if (mqtt_app_is_connected()) {
+            float ta=0, to=0, tc=0;
+            if (ds18b20_read_one(PIN_ONEWIRE, ID_AMB, &ta) == ESP_OK) t_read=ta; 
+            // Truco: leemos en variables locales primero
+            if (ds18b20_read_one(PIN_ONEWIRE, ID_AMB, &ta) == ESP_OK) {}; // Dummy read fix
+            ds18b20_read_one(PIN_ONEWIRE, ID_AMB, &ta);
+            ds18b20_read_one(PIN_ONEWIRE, ID_OUT, &to);
+            ds18b20_read_one(PIN_ONEWIRE, ID_COIL, &tc);
+
+            // 2. Lógica de Control (Rápida, con Mutex)
+            if (xSemaphoreTake(xMutexSys, pdMS_TO_TICKS(500)) == pdTRUE) {
+                sys.t_amb = ta; sys.t_out = to; sys.t_coil = tc;
+
+                // Lógica de termostato y protecciones
+                if (!sys.freeze_mode && sys.t_coil < FREEZE_LIMIT_C) {
+                    sys.freeze_mode = true;
+                    sys.comp_active = false;
+                    set_relays(false, 3);
+                    last_comp_stop_time = esp_timer_get_time();
+                } else if (sys.freeze_mode) {
+                    if (sys.t_coil > FREEZE_RESET_C) sys.freeze_mode = false;
+                } else if (sys.cfg.system_on) {
+                    if (sys.t_amb > (sys.cfg.setpoint + 1.0) && !sys.comp_active) {
+                        if (is_safe_to_start()) {
+                            sys.comp_active = true;
+                            set_relays(true, sys.cfg.fan_speed);
+                            sys.protection_wait = false;
+                        } else sys.protection_wait = true;
+                    } else if (sys.t_amb < (sys.cfg.setpoint - 1.0) && sys.comp_active) {
+                        sys.comp_active = false;
+                        set_relays(false, sys.cfg.fan_speed);
+                        last_comp_stop_time = esp_timer_get_time();
+                        sys.protection_wait = false;
+                    }
+                } else {
+                    sys.comp_active = false;
+                    set_relays(false, 0);
+                }
+                
+                // Armar JSON para enviar (con datos consistentes)
                 snprintf(json, sizeof(json), 
-                    "{\"v\":%.1f,\"a\":%.2f,\"amb\":%.2f,\"out\":%.2f,\"coil\":%.2f,\"on\":%d,\"fan\":%d}", 
-                    sys.volt, sys.amp, sys.t_amb, sys.t_out, sys.t_coil, sys.comp_active, sys.cfg.fan_speed);
-                mqtt_app_publish(MQTT_TOPIC_TELEMETRY, json);
+                    "{\"v\":%.1f,\"a\":%.2f,\"amb\":%.2f,\"coil\":%.2f,\"on\":%d,\"fan\":%d}", 
+                    sys.volt, sys.amp, sys.t_amb, sys.t_coil, sys.comp_active, sys.cfg.fan_speed);
+                
+                xSemaphoreGive(xMutexSys); // 🔓
             }
         }
 
-        // Control
-        if (!sys.freeze_mode && sys.t_coil < FREEZE_LIMIT_C) {
-            sys.freeze_mode = true;
-            sys.comp_active = false;
-            set_relays(false, 3);
-            last_comp_stop_time = esp_timer_get_time();
-        } else if (sys.freeze_mode) {
-            if (sys.t_coil > FREEZE_RESET_C) sys.freeze_mode = false;
-        } else if (sys.cfg.system_on) {
-            if (sys.t_amb > (sys.cfg.setpoint + 1.0) && !sys.comp_active) {
-                if (is_safe_to_start()) {
-                    sys.comp_active = true;
-                    set_relays(true, sys.cfg.fan_speed);
-                    sys.protection_wait = false;
-                } else sys.protection_wait = true;
-            } else if (sys.t_amb < (sys.cfg.setpoint - 1.0) && sys.comp_active) {
-                sys.comp_active = false;
-                set_relays(false, sys.cfg.fan_speed);
-                last_comp_stop_time = esp_timer_get_time();
-                sys.protection_wait = false;
-            }
-        } else {
-            sys.comp_active = false;
-            set_relays(false, 0);
+        // 3. Enviar Telemetría
+        if (mqtt_app_is_connected()) {
+            mqtt_app_publish(MQTT_TOPIC_TELEMETRY, json);
         }
         
         esp_task_wdt_reset();
@@ -193,50 +276,20 @@ void task_climate(void *pv) {
     }
 }
 
-// --- TAREA MEDICIÓN ENERGÍA (CON FILTRO) ---
-// --- TAREA MEDICIÓN ENERGÍA (CON FILTRO + LOG SERIAL) ---
 void task_meter(void *pv) {
-    float v_inst = 0.0, i_inst = 0.0, w_inst = 0.0;
-    
-    // Variable estática: guarda el valor anterior en memoria
-    static float v_ema = 0.0; 
-
-    // FACTOR DE SUAVIZADO (Alpha)
-    // 0.10 = Muy lento y estable (como un tester lento)
-    // 0.20 = Reacción media (Recomendado)
-    // 1.00 = Sin filtro (Saltos bruscos)
-    const float alpha = 0.10; 
-
+    float v, i, w;
     while(1) {
-        // 1. Leer valor instantáneo del sensor (Raw)
-        ac_meter_read_rms(&v_inst, &i_inst, &w_inst);
-        
-        // 2. ALGORITMO DE FILTRADO (Exponential Moving Average)
-        if (v_ema == 0.0) {
-            v_ema = v_inst; // Inicialización rápida al arrancar
-        } else {
-            // Fórmula: NuevoPromedio = (Factor * LecturaActual) + ((1 - Factor) * PromedioAnterior)
-            v_ema = (alpha * v_inst) + ((1.0 - alpha) * v_ema);
+        ac_meter_read_rms(&v, &i, &w);
+        if (xSemaphoreTake(xMutexSys, pdMS_TO_TICKS(50)) == pdTRUE) {
+            sys.volt = v; sys.amp = i; sys.watt = w;
+            xSemaphoreGive(xMutexSys);
         }
-
-        // 3. Compuerta de Ruido (Noise Gate)
-        // Si el promedio baja de 15V, asumimos que está apagado o desconectado
-        if (v_ema < 15.0) v_ema = 0.0;
-        
-        // 4. Actualizar Variables Globales (Lo que ve el LCD y MQTT)
-        sys.volt = v_ema;   // Usamos el valor filtrado
-        sys.amp = i_inst;
-        sys.watt = w_inst;
-
-        // 5. IMPRIMIR EN SERIAL (Para depuración)
-        // Muestra: Voltaje Crudo vs Voltaje Filtrado
-        ESP_LOGI(TAG, "⚡ Raw: %5.1f V | Filtrado: %5.1f V | Amp: %.2f A", v_inst, sys.volt, sys.amp);
-
-        vTaskDelay(pdMS_TO_TICKS(250)); // 4 lecturas por segundo
+        vTaskDelay(pdMS_TO_TICKS(200));
     }
 }
 
 void app_main(void) {
+    // 1. Iniciar NVS
     esp_err_t ret = nvs_flash_init();
     if (ret == ESP_ERR_NVS_NO_FREE_PAGES || ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
         ESP_ERROR_CHECK(nvs_flash_erase());
@@ -244,24 +297,32 @@ void app_main(void) {
     }
     ESP_ERROR_CHECK(ret);
 
+    // 2. Crear Mutex (CRITICO)
+    xMutexSys = xSemaphoreCreateMutex();
+
     gpio_install_isr_service(0);
-    
-    // --- INICIA MEDICIÓN REAL ---
-    ac_meter_init(PIN_ZMPT, PIN_SCT); // GPIO 34 y 35
-    
+    ac_meter_init(PIN_ZMPT, PIN_SCT);
+    storage_init(); // Iniciar sistema de guardado
+
     gpio_reset_pin(PIN_COMPRESOR); gpio_set_direction(PIN_COMPRESOR, GPIO_MODE_OUTPUT);
     gpio_reset_pin(PIN_FAN_L); gpio_set_direction(PIN_FAN_L, GPIO_MODE_OUTPUT);
     gpio_reset_pin(PIN_FAN_M); gpio_set_direction(PIN_FAN_M, GPIO_MODE_OUTPUT);
     gpio_reset_pin(PIN_FAN_H); gpio_set_direction(PIN_FAN_H, GPIO_MODE_OUTPUT);
     set_relays(false, 0);
 
-    sys.cfg.setpoint = 24.0;
-    sys.cfg.fan_speed = 1;
-    sys.cfg.system_on = true;
+    // 3. Cargar configuración guardada (o defaults)
+    if (!storage_load(&sys.cfg)) {
+        sys.cfg.setpoint = 24.0;
+        sys.cfg.fan_speed = 1;
+        sys.cfg.system_on = true;
+    }
     sys.t_amb = 25.0; sys.t_coil = 20.0; sys.t_out = 20.0;
 
     wifi_portal_init(); 
-    mqtt_app_start(); // --- INICIA MQTT ---
+    
+    // 4. Configurar MQTT con el Callback (EL ESLABÓN PERDIDO)
+    mqtt_app_set_rx_callback(mqtt_data_handler); 
+    mqtt_app_start(); 
     
     esp_task_wdt_config_t wdt_conf = { .timeout_ms = WDT_TIMEOUT_MS, .trigger_panic = true };
     if (esp_task_wdt_status(NULL) != ESP_OK) esp_task_wdt_init(&wdt_conf);
@@ -270,5 +331,5 @@ void app_main(void) {
     xTaskCreate(task_meter, "Meter", 4096, NULL, 3, NULL);
     xTaskCreate(task_ui, "UI", 4096, NULL, 2, NULL);
     
-    ESP_LOGI(TAG, "Sistema v7.0 (20x4 + MQTT + Voltaje Real) INICIADO");
+    ESP_LOGI(TAG, "Sistema v7.1 (Full Control + Persistence) INICIADO");
 }
