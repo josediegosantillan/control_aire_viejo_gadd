@@ -103,7 +103,8 @@ int get_wifi_status() {
 // --- �📡 CALLBACK DE RECEPCIÓN MQTT (El cerebro que faltaba) ---
 void mqtt_data_handler(const char *topic, int topic_len, const char *data, int data_len) {
     // Verificar tópico
-    if (strncmp(topic, MQTT_TOPIC_CONFIG, topic_len) == 0) {
+    int config_len = (int)strlen(MQTT_TOPIC_CONFIG);
+    if (topic_len == config_len && strncmp(topic, MQTT_TOPIC_CONFIG, topic_len) == 0) {
         ESP_LOGI(TAG, "📩 Orden recibida: %.*s", data_len, data);
 
         cJSON *root = cJSON_ParseWithLength(data, data_len);
@@ -149,6 +150,16 @@ void mqtt_data_handler(const char *topic, int topic_len, const char *data, int d
                     }
                 }
 
+                bool was_comp_active = sys.comp_active;
+                bool force_comp_off = (!sys.cfg.system_on) || (sys.cfg.mode != MODE_COOL);
+                if (force_comp_off) {
+                    if (was_comp_active) {
+                        last_comp_stop_time = esp_timer_get_time();
+                    }
+                    sys.comp_active = false;
+                    sys.protection_wait = false;
+                }
+
                 // Guardar en Flash para que no se borre al reiniciar
                 storage_save(&sys.cfg);
 
@@ -183,7 +194,7 @@ void mqtt_data_handler(const char *topic, int topic_len, const char *data, int d
 // --- UI 20x4 ---
 void task_ui(void *pv) {
     char buffer[32];
-    struct SystemState sys_copy; // Copia local para no trabar el sistema
+    struct SystemState sys_copy = {0}; // Copia local para no trabar el sistema
 
     i2c_master_init();
     i2c_lcd_init(I2C_lcd_addr);
@@ -248,25 +259,40 @@ void task_climate(void *pv) {
     esp_task_wdt_add(NULL);
     char json[120];       // JSON telemetría (solo sensores)
     char estado_json[150]; // JSON estado (config actual)
+    bool payload_ready = false;
+
+    json[0] = '\0';
+    estado_json[0] = '\0';
 
     while(1) {
         // 1. Lectura Sensores (Lenta, afuera del mutex)
         if (ds18b20_convert_all(PIN_ONEWIRE) == ESP_OK) {
             float ta=0, to=0, tc=0;
-            ds18b20_read_one(PIN_ONEWIRE, ID_AMB, &ta);
-            ds18b20_read_one(PIN_ONEWIRE, ID_OUT, &to);
-            ds18b20_read_one(PIN_ONEWIRE, ID_COIL, &tc);
+            bool ok_amb = false;
+            bool ok_out = false;
+            bool ok_coil = false;
+
+            vTaskDelay(pdMS_TO_TICKS(750));
+            ok_amb = (ds18b20_read_one(PIN_ONEWIRE, ID_AMB, &ta) == ESP_OK);
+            ok_out = (ds18b20_read_one(PIN_ONEWIRE, ID_OUT, &to) == ESP_OK);
+            ok_coil = (ds18b20_read_one(PIN_ONEWIRE, ID_COIL, &tc) == ESP_OK);
 
             // 2. Lógica de Control (Rápida, con Mutex)
             if (xSemaphoreTake(xMutexSys, pdMS_TO_TICKS(500)) == pdTRUE) {
-                sys.t_amb = ta; sys.t_out = to; sys.t_coil = tc;
+                if (ok_amb) sys.t_amb = ta;
+                if (ok_out) sys.t_out = to;
+                if (ok_coil) sys.t_coil = tc;
+                bool was_comp_active = sys.comp_active;
 
                 // Lógica de termostato y protecciones
                 if (!sys.freeze_mode && sys.t_coil < FREEZE_LIMIT_C) {
                     sys.freeze_mode = true;
-                    sys.comp_active = false;
+                    if (sys.comp_active) {
+                        sys.comp_active = false;
+                        last_comp_stop_time = esp_timer_get_time();
+                    }
                     set_relays(false, 3);
-                    last_comp_stop_time = esp_timer_get_time();
+                    sys.protection_wait = false;
                 } else if (sys.freeze_mode) {
                     if (sys.t_coil > FREEZE_RESET_C) sys.freeze_mode = false;
                 } else if (sys.cfg.system_on && sys.cfg.mode != MODE_OFF) {
@@ -275,6 +301,7 @@ void task_climate(void *pv) {
                         sys.comp_active = false;
                         set_relays(false, sys.cfg.fan_speed);
                         sys.protection_wait = false;
+                        if (was_comp_active) last_comp_stop_time = esp_timer_get_time();
                     }
                     // Modo frío: lógica de termostato normal
                     else if (sys.cfg.mode == MODE_COOL) {
@@ -292,8 +319,10 @@ void task_climate(void *pv) {
                         }
                     }
                 } else {
+                    if (was_comp_active) last_comp_stop_time = esp_timer_get_time();
                     sys.comp_active = false;
                     set_relays(false, 0);
+                    sys.protection_wait = false;
                 }
                 
                 // Actualizar LEDs según estado del sistema
@@ -312,6 +341,7 @@ void task_climate(void *pv) {
                     sys.cfg.fan_speed,
                     sys.cfg.mode,
                     sys.cfg.setpoint);
+                payload_ready = true;
                 
                 // 📊 LOG COMPLETO DEL SISTEMA
                 const char *mode_names[] = {"OFF", "FRIO", "VENTILACION"};
@@ -327,7 +357,7 @@ void task_climate(void *pv) {
         }
 
         // 3. Enviar Telemetría (sensores) y Estado (config) por separado
-        if (mqtt_app_is_connected()) {
+        if (payload_ready && mqtt_app_is_connected()) {
             mqtt_app_publish(MQTT_TOPIC_TELEMETRY, json);   // Solo sensores
             mqtt_app_publish(MQTT_TOPIC_STATUS, estado_json); // Config actual
         }
@@ -378,7 +408,11 @@ void task_power_button(void *pv) {
                     
                     // Si el sistema se apagó, apagar todo
                     if (!sys.cfg.system_on) {
+                        if (sys.comp_active) {
+                            last_comp_stop_time = esp_timer_get_time();
+                        }
                         sys.comp_active = false;
+                        sys.protection_wait = false;
                         set_relays(false, 0);
                     }
                     
@@ -442,6 +476,9 @@ void app_main(void) {
         sys.cfg.system_on = true;
         sys.cfg.mode = MODE_COOL; // Modo frío por defecto
     }
+    if (sys.cfg.fan_speed < 0 || sys.cfg.fan_speed > 3) sys.cfg.fan_speed = 1;
+    if (sys.cfg.setpoint < 16.0 || sys.cfg.setpoint > 30.0) sys.cfg.setpoint = 24.0;
+    if (sys.cfg.mode < MODE_OFF || sys.cfg.mode > MODE_FAN) sys.cfg.mode = MODE_COOL;
     sys.t_amb = 25.0; sys.t_coil = 20.0; sys.t_out = 20.0;
 
     wifi_portal_init(); 
