@@ -10,9 +10,14 @@
 // --- PINES DE SENSORES (Entradas) ---
 #define PIN_DS18B20_AMB  GPIO_NUM_4   // Sensor Ambiente (Original)
 #define PIN_DS18B20_COIL GPIO_NUM_18  // NUEVO: Sensor Cañería (Protección Hielo)
-#define PIN_PIR          GPIO_NUM_13
+#define PIN_PIR          GPIO_NUM_15  // Sensor PIR movido a GPIO 15
 #define PIN_ZMPT         GPIO_NUM_34  // ADC1 CH6
 #define PIN_SCT          GPIO_NUM_35  // ADC1 CH7
+
+// --- PINES DE CONTROL DE POTENCIA (Botón y LEDs) ---
+#define PIN_BUTTON_POWER GPIO_NUM_13  // Botón on/off (activo por LOW con pull-up)
+#define PIN_LED_RED      GPIO_NUM_32  // LED rojo (encendido por LOW cuando sistema está OFF)
+#define PIN_LED_GREEN    GPIO_NUM_33  // LED verde (encendido por LOW cuando sistema está ON)
 
 // --- I2C ---
 #define PIN_I2C_SDA      GPIO_NUM_21

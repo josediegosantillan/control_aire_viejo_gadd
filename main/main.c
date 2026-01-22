@@ -22,7 +22,8 @@
 #include "ac_storage.h"      // 👈 Para guardar config (Persistence)      
 #include "ds18b20.h"        
 #include "i2c_lcd.h"
-#include "mqtt_connector.h" 
+#include "mqtt_connector.h"
+#include "power_control.h"   // 👈 Control de botón y LEDs 
 
 static const char *TAG = "MAIN_SYSTEM";
 
@@ -50,6 +51,10 @@ struct SystemState {
 } sys;
 
 int64_t last_comp_stop_time = - (SAFETY_DELAY_MIN * 60 * 1000000LL);
+
+// Variables para manejo del botón
+static bool button_last_state = false;  // false = no presionado
+static int button_stable_count = 0;
 
 // --- AUXILIARES ---
 static esp_err_t i2c_master_init(void) {
@@ -94,7 +99,8 @@ int get_wifi_status() {
     return 0; 
 }
 
-// --- 📡 CALLBACK DE RECEPCIÓN MQTT (El cerebro que faltaba) ---
+
+// --- �📡 CALLBACK DE RECEPCIÓN MQTT (El cerebro que faltaba) ---
 void mqtt_data_handler(const char *topic, int topic_len, const char *data, int data_len) {
     // Verificar tópico
     if (strncmp(topic, MQTT_TOPIC_CONFIG, topic_len) == 0) {
@@ -131,6 +137,17 @@ void mqtt_data_handler(const char *topic, int topic_len, const char *data, int d
                         ESP_LOGI(TAG, "📡 Node-RED CMD: Temp. Objetivo = %.1f°C", sp);
                     }
                 }
+                
+                // Nuevo: Modo de operación
+                cJSON *j_mode = cJSON_GetObjectItem(root, "mode");
+                if (j_mode) {
+                    int mode = j_mode->valueint;
+                    if (mode >= MODE_OFF && mode <= MODE_FAN) {
+                        sys.cfg.mode = mode;
+                        const char *mode_str[] = {"OFF", "FRIO", "VENTILACION"};
+                        ESP_LOGI(TAG, "📡 Node-RED CMD: Modo = %s", mode_str[mode]);
+                    }
+                }
 
                 // Guardar en Flash para que no se borre al reiniciar
                 storage_save(&sys.cfg);
@@ -138,16 +155,22 @@ void mqtt_data_handler(const char *topic, int topic_len, const char *data, int d
                 // Copiar estados para actuar YA (sin bloquear mutex)
                 bool current_on = sys.cfg.system_on;
                 int current_fan = sys.cfg.fan_speed;
+                int current_mode = sys.cfg.mode;
                 bool comp_state = sys.comp_active;
 
                 xSemaphoreGive(xMutexSys); // 🔓 Liberar
 
                 // Aplicar cambios físicos inmediatos
-                if (!current_on) {
+                if (!current_on || current_mode == MODE_OFF) {
                     set_relays(false, 0); // Apagar todo
-                } else {
-                    set_relays(comp_state, current_fan); // Actualizar ventilador, mantener compresor
+                } else if (current_mode == MODE_FAN) {
+                    set_relays(false, current_fan); // Modo ventilación: compresor OFF, fan ON
+                } else if (current_mode == MODE_COOL) {
+                    set_relays(comp_state, current_fan); // Modo frío: mantener estado compresor
                 }
+                
+                // Actualizar LEDs según estado
+                power_control_update_leds(current_on);
 
             } else {
                 ESP_LOGW(TAG, "⚠️ Sistema ocupado, ignorando comando MQTT");
@@ -194,7 +217,11 @@ void task_ui(void *pv) {
              snprintf(buffer, 32, "ESPERA: %ds          ", wait);
              i2c_lcd_write_text(0, 0, buffer);
         } else if (sys_copy.cfg.system_on) {
-             snprintf(buffer, 32, "FRIO:%s FAN:%d SP:%.0f", sys_copy.comp_active?"ON ":"OFF", sys_copy.cfg.fan_speed, sys_copy.cfg.setpoint);
+             if (sys_copy.cfg.mode == MODE_FAN) {
+                 snprintf(buffer, 32, "VENT FAN:%d          ", sys_copy.cfg.fan_speed);
+             } else {
+                 snprintf(buffer, 32, "FRIO:%s FAN:%d SP:%.0f", sys_copy.comp_active?"ON ":"OFF", sys_copy.cfg.fan_speed, sys_copy.cfg.setpoint);
+             }
              i2c_lcd_write_text(0, 0, buffer);
         } else i2c_lcd_write_text(0, 0, "SISTEMA APAGADO     ");
 
@@ -219,7 +246,8 @@ void task_ui(void *pv) {
 void task_climate(void *pv) {
     ds18b20_init_bus(PIN_ONEWIRE);
     esp_task_wdt_add(NULL);
-    char json[150];
+    char json[120];       // JSON telemetría (solo sensores)
+    char estado_json[150]; // JSON estado (config actual)
 
     while(1) {
         // 1. Lectura Sensores (Lenta, afuera del mutex)
@@ -241,43 +269,67 @@ void task_climate(void *pv) {
                     last_comp_stop_time = esp_timer_get_time();
                 } else if (sys.freeze_mode) {
                     if (sys.t_coil > FREEZE_RESET_C) sys.freeze_mode = false;
-                } else if (sys.cfg.system_on) {
-                    if (sys.t_amb > (sys.cfg.setpoint + 1.0) && !sys.comp_active) {
-                        if (is_safe_to_start()) {
-                            sys.comp_active = true;
-                            set_relays(true, sys.cfg.fan_speed);
-                            sys.protection_wait = false;
-                        } else sys.protection_wait = true;
-                    } else if (sys.t_amb < (sys.cfg.setpoint - 1.0) && sys.comp_active) {
+                } else if (sys.cfg.system_on && sys.cfg.mode != MODE_OFF) {
+                    // Modo ventilación: solo forzador, sin compresor
+                    if (sys.cfg.mode == MODE_FAN) {
                         sys.comp_active = false;
                         set_relays(false, sys.cfg.fan_speed);
-                        last_comp_stop_time = esp_timer_get_time();
                         sys.protection_wait = false;
+                    }
+                    // Modo frío: lógica de termostato normal
+                    else if (sys.cfg.mode == MODE_COOL) {
+                        if (sys.t_amb > (sys.cfg.setpoint + 1.0) && !sys.comp_active) {
+                            if (is_safe_to_start()) {
+                                sys.comp_active = true;
+                                set_relays(true, sys.cfg.fan_speed);
+                                sys.protection_wait = false;
+                            } else sys.protection_wait = true;
+                        } else if (sys.t_amb < (sys.cfg.setpoint - 1.0) && sys.comp_active) {
+                            sys.comp_active = false;
+                            set_relays(false, sys.cfg.fan_speed);
+                            last_comp_stop_time = esp_timer_get_time();
+                            sys.protection_wait = false;
+                        }
                     }
                 } else {
                     sys.comp_active = false;
                     set_relays(false, 0);
                 }
                 
-                // Armar JSON para enviar (con datos consistentes)
+                // Actualizar LEDs según estado del sistema
+                power_control_update_leds(sys.cfg.system_on);
+                
+                // JSON de telemetría (SOLO sensores - datos de medición)
                 snprintf(json, sizeof(json), 
-                    "{\"v\":%.1f,\"a\":%.2f,\"amb\":%.2f,\"out\":%.2f,\"coil\":%.2f,\"on\":%d,\"fan\":%d}", 
-                    sys.volt, sys.amp, sys.t_amb, sys.t_out, sys.t_coil, sys.comp_active, sys.cfg.fan_speed);
+                    "{\"v\":%.1f,\"a\":%.2f,\"amb\":%.2f,\"out\":%.2f,\"coil\":%.2f}", 
+                    sys.volt, sys.amp, sys.t_amb, sys.t_out, sys.t_coil);
+                
+                // JSON de estado (configuración actual del sistema)
+                snprintf(estado_json, sizeof(estado_json),
+                    "{\"sys_on\":%s,\"comp\":%d,\"fan\":%d,\"mode\":%d,\"sp\":%.1f}",
+                    sys.cfg.system_on ? "true" : "false",
+                    sys.comp_active,
+                    sys.cfg.fan_speed,
+                    sys.cfg.mode,
+                    sys.cfg.setpoint);
                 
                 // 📊 LOG COMPLETO DEL SISTEMA
+                const char *mode_names[] = {"OFF", "FRIO", "VENTILACION"};
                 ESP_LOGI(TAG, "═══════════════════════════════════════════════════════════");
                 ESP_LOGI(TAG, "⚡ Tensión: %.1fV | Intensidad: %.2fA | Potencia: %.0fW", sys.volt, sys.amp, sys.watt);
                 ESP_LOGI(TAG, "🌡️  T.Ambiente: %.1f°C | T.Cañería: %.1f°C | T.Exterior: %.1f°C", sys.t_amb, sys.t_coil, sys.t_out);
-                ESP_LOGI(TAG, "🎯 Objetivo: %.1f°C | Fan: %d | Compresor: %s", sys.cfg.setpoint, sys.cfg.fan_speed, sys.comp_active?"ON":"OFF");
+                ESP_LOGI(TAG, "🎯 Modo: %s | Objetivo: %.1f°C | Fan: %d | Compresor: %s", 
+                    mode_names[sys.cfg.mode], sys.cfg.setpoint, sys.cfg.fan_speed, sys.comp_active?"ON":"OFF");
                 ESP_LOGI(TAG, "═══════════════════════════════════════════════════════════");
                 
                 xSemaphoreGive(xMutexSys); // 🔓
             }
         }
 
-        // 3. Enviar Telemetría
+        // 3. Enviar Telemetría (sensores) y Estado (config) por separado
         if (mqtt_app_is_connected()) {
-            mqtt_app_publish(MQTT_TOPIC_TELEMETRY, json);
+            mqtt_app_publish(MQTT_TOPIC_TELEMETRY, json);   // Solo sensores
+            mqtt_app_publish(MQTT_TOPIC_STATUS, estado_json); // Config actual
         }
         
         esp_task_wdt_reset();
@@ -294,6 +346,67 @@ void task_meter(void *pv) {
             xSemaphoreGive(xMutexSys);
         }
         vTaskDelay(pdMS_TO_TICKS(200));
+    }
+}
+
+// --- 🔘 TAREA DE DETECCIÓN DE BOTÓN ---
+void task_power_button(void *pv) {
+    ESP_LOGI(TAG, "🔘 Tarea de botón iniciada");
+    
+    while(1) {
+        bool button_current = power_control_button_pressed();
+        
+        // Detectar flanco de bajada (transición de NO presionado a presionado)
+        if (button_current && !button_last_state) {
+            button_stable_count++;
+            
+            // Requiere 3 lecturas consecutivas para confirmar presión (debounce)
+            if (button_stable_count >= 3) {
+                // Confirmar presión - cambiar estado del sistema
+                ESP_LOGI(TAG, "🔘 Botón detectado");
+                
+                if (xSemaphoreTake(xMutexSys, pdMS_TO_TICKS(200)) == pdTRUE) {
+                    sys.cfg.system_on = !sys.cfg.system_on; // Toggle
+                    
+                    ESP_LOGI(TAG, "🔘 Sistema %s", sys.cfg.system_on ? "ON ✅" : "OFF ❌");
+                    
+                    // Guardar en Flash
+                    storage_save(&sys.cfg);
+                    
+                    // Actualizar LEDs inmediatamente
+                    power_control_update_leds(sys.cfg.system_on);
+                    
+                    // Si el sistema se apagó, apagar todo
+                    if (!sys.cfg.system_on) {
+                        sys.comp_active = false;
+                        set_relays(false, 0);
+                    }
+                    
+                    xSemaphoreGive(xMutexSys);
+                }
+                
+                // Marcar como procesado
+                button_last_state = true;
+                button_stable_count = 0;
+                
+                // Esperar a que se suelte el botón
+                while (power_control_button_pressed()) {
+                    vTaskDelay(pdMS_TO_TICKS(50));
+                }
+                
+                // Esperar un poco más después de soltar
+                vTaskDelay(pdMS_TO_TICKS(200));
+            }
+        } else if (!button_current && button_last_state) {
+            // Botón soltado
+            button_last_state = false;
+            button_stable_count = 0;
+        } else if (!button_current) {
+            // Resetear contador si no está presionado
+            button_stable_count = 0;
+        }
+        
+        vTaskDelay(pdMS_TO_TICKS(50)); // Muestreo cada 50ms
     }
 }
 
@@ -319,11 +432,15 @@ void app_main(void) {
     gpio_reset_pin(PIN_FAN_H); gpio_set_direction(PIN_FAN_H, GPIO_MODE_OUTPUT);
     set_relays(false, 0);
 
+    // 🔘 Inicializar botón y LEDs
+    ESP_ERROR_CHECK(power_control_init());
+
     // 3. Cargar configuración guardada (o defaults)
     if (!storage_load(&sys.cfg)) {
         sys.cfg.setpoint = 24.0;
         sys.cfg.fan_speed = 1;
         sys.cfg.system_on = true;
+        sys.cfg.mode = MODE_COOL; // Modo frío por defecto
     }
     sys.t_amb = 25.0; sys.t_coil = 20.0; sys.t_out = 20.0;
 
@@ -339,6 +456,7 @@ void app_main(void) {
     xTaskCreate(task_climate, "Climate", 4096, NULL, 5, NULL);
     xTaskCreate(task_meter, "Meter", 4096, NULL, 3, NULL);
     xTaskCreate(task_ui, "UI", 4096, NULL, 2, NULL);
+    xTaskCreate(task_power_button, "PowerBtn", 2048, NULL, 4, NULL); // 🔘 Tarea del botón
     
     ESP_LOGI(TAG, "Sistema v7.1 (Full Control + Persistence) INICIADO");
 }
