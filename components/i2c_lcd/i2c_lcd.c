@@ -1,10 +1,26 @@
 #include "i2c_lcd.h"
 #include "esp_log.h"
+#include "esp_timer.h"
 #include "driver/i2c.h"
 #include <unistd.h>
 
 static const char *TAG = "I2C_LCD";
+
+#define LCD_RECOVERY_THRESHOLD 3
+#define LCD_RECOVERY_BASE_MS 1000
+#define LCD_RECOVERY_MAX_MS 60000
+
 static uint8_t _addr;
+static bool s_backlight_on = true;
+static uint8_t s_write_failures = 0;
+static bool s_in_recovery = false;
+static uint32_t s_recovery_backoff_ms = LCD_RECOVERY_BASE_MS;
+static int64_t s_next_recovery_us = 0;
+
+static void lcd_recovery_reset(void) {
+    s_recovery_backoff_ms = LCD_RECOVERY_BASE_MS;
+    s_next_recovery_us = 0;
+}
 
 // Comandos LCD
 #define LCD_CLEARDISPLAY 0x01
@@ -24,13 +40,28 @@ static uint8_t _addr;
 #define LCD_RS_BIT 0x01 
 
 static esp_err_t i2c_lcd_write_byte(uint8_t val) {
+    uint8_t out = val;
+    if (s_backlight_on) {
+        out |= LCD_BACKLIGHT;
+    }
     i2c_cmd_handle_t cmd = i2c_cmd_link_create();
     i2c_master_start(cmd);
     i2c_master_write_byte(cmd, (_addr << 1) | I2C_MASTER_WRITE, true);
-    i2c_master_write_byte(cmd, val | LCD_BACKLIGHT, true);
+    i2c_master_write_byte(cmd, out, true);
     i2c_master_stop(cmd);
     esp_err_t ret = i2c_master_cmd_begin(I2C_NUM_0, cmd, pdMS_TO_TICKS(100));
     i2c_cmd_link_delete(cmd);
+    if (ret != ESP_OK) {
+        if (++s_write_failures >= LCD_RECOVERY_THRESHOLD) {
+            s_write_failures = 0;
+            i2c_lcd_reinit();
+        }
+    } else {
+        if (s_write_failures) {
+            s_write_failures = 0;
+        }
+        lcd_recovery_reset();
+    }
     return ret;
 }
 
@@ -58,6 +89,7 @@ static void i2c_lcd_send_byte(uint8_t val, uint8_t mode) {
 
 void i2c_lcd_init(uint8_t addr) {
     _addr = addr;
+    s_write_failures = 0;
     usleep(50000);
     
     i2c_lcd_write_nibble(0x30, 0); usleep(4500);
@@ -70,6 +102,35 @@ void i2c_lcd_init(uint8_t addr) {
     i2c_lcd_send_byte(0x06, 0); 
     i2c_lcd_send_byte(0x01, 0); 
     usleep(2000);
+}
+
+void i2c_lcd_reinit(void) {
+    int64_t now = esp_timer_get_time();
+    if (s_in_recovery) {
+        return;
+    }
+    if (s_next_recovery_us != 0 && now < s_next_recovery_us) {
+        return;
+    }
+    s_in_recovery = true;
+    bool backlight = s_backlight_on;
+    ESP_LOGW(TAG, "LCD reinitializing");
+    i2c_lcd_init(_addr);
+    if (s_backlight_on != backlight) {
+        i2c_lcd_set_backlight(backlight);
+    }
+    if (i2c_lcd_is_alive() == ESP_OK) {
+        lcd_recovery_reset();
+    } else {
+        if (s_recovery_backoff_ms < LCD_RECOVERY_MAX_MS) {
+            s_recovery_backoff_ms *= 2;
+            if (s_recovery_backoff_ms > LCD_RECOVERY_MAX_MS) {
+                s_recovery_backoff_ms = LCD_RECOVERY_MAX_MS;
+            }
+        }
+        s_next_recovery_us = now + (int64_t)s_recovery_backoff_ms * 1000;
+    }
+    s_in_recovery = false;
 }
 
 // --- CORRECCIÓN AQUÍ: uint8_t en lugar de int ---
@@ -101,4 +162,9 @@ esp_err_t i2c_lcd_is_alive(void) {
     esp_err_t ret = i2c_master_cmd_begin(I2C_NUM_0, cmd, pdMS_TO_TICKS(50));
     i2c_cmd_link_delete(cmd);
     return ret;
+}
+
+void i2c_lcd_set_backlight(bool on) {
+    s_backlight_on = on;
+    i2c_lcd_write_byte(0x00);
 }

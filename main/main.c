@@ -31,6 +31,10 @@ static const char *TAG = "MAIN_SYSTEM";
 #define PIN_ONEWIRE GPIO_NUM_4  
 #define PIN_ZMPT    GPIO_NUM_34 
 #define PIN_SCT     GPIO_NUM_35 
+#define PIR_LCD_TIMEOUT_MS 20000
+#define LCD_FORCE_REINIT_MS 60000
+#define LCD_BUS_RECOVERY_BASE_MS 2000
+#define LCD_BUS_RECOVERY_MAX_MS 60000
 
 // IDs Sensores (Hardcodeados)
 const ds18b20_addr_t ID_COIL = { {0x28, 0xF4, 0xD6, 0x57, 0x04, 0xE1, 0x3C, 0x1E} };
@@ -195,20 +199,75 @@ void mqtt_data_handler(const char *topic, int topic_len, const char *data, int d
 void task_ui(void *pv) {
     char buffer[32];
     struct SystemState sys_copy = {0}; // Copia local para no trabar el sistema
+    int64_t last_motion_time = -1;
+    int64_t last_lcd_reset = -1;
+    int64_t lcd_bus_block_until = 0;
+    uint32_t lcd_bus_backoff_ms = LCD_BUS_RECOVERY_BASE_MS;
+    bool backlight_on = false;
 
     i2c_master_init();
     i2c_lcd_init(I2C_lcd_addr);
+    i2c_lcd_set_backlight(false);
     i2c_lcd_clear();
     i2c_lcd_write_text(0, 0, "   GADD CLIMA v7.0  ");
     vTaskDelay(pdMS_TO_TICKS(1500));
     i2c_lcd_clear();
+    last_lcd_reset = esp_timer_get_time();
 
     while(1) {
-        if (i2c_lcd_is_alive() != ESP_OK) {
-            i2c_driver_delete(I2C_NUM_0);
-            vTaskDelay(pdMS_TO_TICKS(100));
-            i2c_master_init();
-            i2c_lcd_init(I2C_lcd_addr);
+        int64_t now = esp_timer_get_time();
+        bool motion = gpio_get_level(PIN_PIR) == 1;
+        if (motion) {
+            last_motion_time = now;
+            if (!backlight_on) {
+                i2c_lcd_reinit();
+                backlight_on = true;
+                i2c_lcd_set_backlight(true);
+                last_lcd_reset = now;
+            }
+        } else if (backlight_on && last_motion_time >= 0) {
+            int64_t elapsed_ms = (now - last_motion_time) / 1000;
+            if (elapsed_ms > PIR_LCD_TIMEOUT_MS) {
+                backlight_on = false;
+                i2c_lcd_set_backlight(false);
+            }
+        }
+
+        bool lcd_ok = (i2c_lcd_is_alive() == ESP_OK);
+        if (!lcd_ok) {
+            if (now >= lcd_bus_block_until) {
+                ESP_LOGW(TAG, "LCD bus recovery");
+                i2c_driver_delete(I2C_NUM_0);
+                vTaskDelay(pdMS_TO_TICKS(100));
+                i2c_master_init();
+                i2c_lcd_init(I2C_lcd_addr);
+                if (!backlight_on) {
+                    i2c_lcd_set_backlight(false);
+                }
+                last_lcd_reset = now;
+                if (lcd_bus_backoff_ms < LCD_BUS_RECOVERY_MAX_MS) {
+                    lcd_bus_backoff_ms *= 2;
+                    if (lcd_bus_backoff_ms > LCD_BUS_RECOVERY_MAX_MS) {
+                        lcd_bus_backoff_ms = LCD_BUS_RECOVERY_MAX_MS;
+                    }
+                }
+                lcd_bus_block_until = now + (int64_t)lcd_bus_backoff_ms * 1000;
+            }
+            vTaskDelay(pdMS_TO_TICKS(200));
+            continue;
+        }
+
+        if (lcd_bus_backoff_ms != LCD_BUS_RECOVERY_BASE_MS) {
+            lcd_bus_backoff_ms = LCD_BUS_RECOVERY_BASE_MS;
+            lcd_bus_block_until = 0;
+        }
+
+        if (backlight_on && last_lcd_reset >= 0) {
+            int64_t reset_elapsed_ms = (now - last_lcd_reset) / 1000;
+            if (reset_elapsed_ms > LCD_FORCE_REINIT_MS) {
+                i2c_lcd_reinit();
+                last_lcd_reset = now;
+            }
         }
 
         // 📸 FOTO INSTANTÁNEA DE LOS DATOS (Thread-Safe)
@@ -465,6 +524,10 @@ void app_main(void) {
     gpio_reset_pin(PIN_FAN_M); gpio_set_direction(PIN_FAN_M, GPIO_MODE_OUTPUT);
     gpio_reset_pin(PIN_FAN_H); gpio_set_direction(PIN_FAN_H, GPIO_MODE_OUTPUT);
     set_relays(false, 0);
+
+    gpio_reset_pin(PIN_PIR);
+    gpio_set_direction(PIN_PIR, GPIO_MODE_INPUT);
+    gpio_set_pull_mode(PIN_PIR, GPIO_PULLDOWN_ONLY);
 
     // 🔘 Inicializar botón y LEDs
     ESP_ERROR_CHECK(power_control_init());
